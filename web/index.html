@@ -1,0 +1,1151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Qwen3-TTS 控制台</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b0f1a;
+        --card: #121826;
+        --muted: #8a94a6;
+        --text: #e5e9f2;
+        --accent: #6ea8ff;
+        --accent-2: #9a7bff;
+        --border: #1f2635;
+        --shadow: 0 20px 60px rgba(2, 6, 23, 0.5);
+      }
+      * { box-sizing: border-box; }
+      body {
+        font-family: "Inter", "Segoe UI", Arial, sans-serif;
+        margin: 0;
+        background: radial-gradient(1200px 600px at 20% -20%, #1c2340, transparent 60%),
+                    radial-gradient(1000px 500px at 120% 0%, #2c1c40, transparent 50%),
+                    var(--bg);
+        color: var(--text);
+      }
+      .page {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 32px 24px 56px;
+      }
+      .header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 24px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      .logo {
+        width: 40px;
+        height: 40px;
+        border-radius: 10px;
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        box-shadow: 0 10px 30px rgba(110, 168, 255, 0.35);
+      }
+      .title { font-size: 22px; font-weight: 700; }
+      .subtitle { color: var(--muted); font-size: 13px; }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 20px;
+        box-shadow: var(--shadow);
+      }
+      .row { margin-bottom: 14px; }
+      label { display: block; margin-bottom: 6px; font-weight: 600; color: #d6dbea; }
+      .checkbox-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-weight: 500;
+        margin-top: 6px;
+      }
+      .checkbox-row input[type="checkbox"] {
+        width: 16px;
+        height: 16px;
+        margin: 0;
+      }
+      input, select, textarea, button {
+        width: 100%;
+        padding: 10px 12px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: #0f1422;
+        color: var(--text);
+        outline: none;
+      }
+      textarea { min-height: 110px; resize: vertical; }
+      input:focus, select:focus, textarea:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 2px rgba(110, 168, 255, 0.15);
+      }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+      .hidden { display: none; }
+      .status { margin-top: 12px; white-space: pre-wrap; color: #b8c1d6; }
+      audio { margin-top: 14px; width: 100%; }
+      .hint { color: var(--muted); font-size: 12px; }
+      .actions { display: flex; gap: 12px; }
+      .primary {
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        border: none;
+        color: #0b0f1a;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .secondary {
+        background: transparent;
+        border: 1px solid var(--border);
+        color: var(--text);
+        cursor: pointer;
+      }
+      .tag {
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(110, 168, 255, 0.16);
+        color: #c7d7ff;
+        font-size: 12px;
+      }
+      .footer {
+        margin-top: 18px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .modal {
+        position: fixed;
+        inset: 0;
+        background: rgba(6, 9, 17, 0.7);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        z-index: 50;
+      }
+      .modal.open { display: flex; }
+      .modal-card {
+        width: min(720px, 92vw);
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 18px;
+        box-shadow: var(--shadow);
+      }
+      .modal-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 12px;
+      }
+      .modal-body { max-height: 60vh; overflow: auto; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { border-bottom: 1px solid var(--border); padding: 8px; text-align: left; }
+      .row-inline { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; margin-bottom: 10px; }
+      .row-inline-4 { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 8px; margin-bottom: 10px; }
+      .icon-btn {
+        background: transparent;
+        border: 1px solid var(--border);
+        color: var(--text);
+        padding: 6px 10px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 12px;
+        width: auto;
+      }
+      .icon-btn:hover {
+        background: rgba(110, 168, 255, 0.1);
+        border-color: var(--accent);
+      }
+      td .icon-btn {
+        padding: 4px 8px;
+      }
+      @media (max-width: 820px) {
+        .grid { grid-template-columns: 1fr; }
+        .actions { flex-direction: column; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <div class="header">
+        <div class="brand">
+          <div class="logo"></div>
+          <div>
+            <div class="title">Qwen3‑TTS 控制台</div>
+            <div class="subtitle">CustomVoice · VoiceDesign · Base (Clone)</div>
+          </div>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <div class="tag">Local API</div>
+        </div>
+      </div>
+
+      <!-- 标签页切换 -->
+      <div style="display:flex; gap:8px; margin-bottom:16px;">
+        <button id="tabGenerate" class="primary" style="width:auto; padding:8px 16px;">
+          🎙️ 语音生成
+        </button>
+        <button id="tabTasks" class="secondary" style="width:auto; padding:8px 16px;">
+          📋 任务管理
+        </button>
+      </div>
+
+      <!-- 语音生成页面 -->
+      <div id="pageGenerate" class="card">
+        <div class="grid">
+          <div class="row">
+            <label for="mode">模式</label>
+            <select id="mode">
+              <option value="custom_voice">CustomVoice（内置音色）</option>
+              <option value="voice_design">VoiceDesign（文字造声）</option>
+              <option value="voice_clone">Base（语音克隆）</option>
+            </select>
+          </div>
+          <div class="row">
+            <label for="modelSize">模型大小</label>
+            <select id="modelSize">
+              <option value="1.7B">1.7B</option>
+              <option value="0.6B">0.6B</option>
+            </select>
+            <div class="hint">VoiceDesign 仅支持 1.7B</div>
+          </div>
+        </div>
+
+        <div class="row">
+          <label for="text">待合成文本</label>
+          <textarea id="text" placeholder="请输入要合成的文本..."></textarea>
+        </div>
+
+        <div class="row">
+          <label for="language">语言</label>
+          <select id="language">
+            <option value="Auto">自动识别</option>
+            <option value="Chinese">中文</option>
+            <option value="English">英文</option>
+            <option value="Japanese">日文</option>
+            <option value="Korean">韩文</option>
+            <option value="German">德文</option>
+            <option value="French">法文</option>
+            <option value="Russian">俄文</option>
+            <option value="Portuguese">葡萄牙文</option>
+            <option value="Spanish">西班牙文</option>
+            <option value="Italian">意大利文</option>
+          </select>
+          <div class="hint">显示中文，提交英文参数</div>
+        </div>
+
+        <div class="row">
+          <label for="speed">语速</label>
+          <input id="speed" type="range" min="0.1" max="2.0" step="0.05" value="1.0" />
+          <div class="hint">当前值：<span id="speedValue">1.0</span></div>
+          <label class="checkbox-row" style="margin-top:8px;">
+            <input id="speedEnabled" type="checkbox" checked />
+            启用语速调节
+          </label>
+        </div>
+
+        <div id="customFields">
+          <div class="row">
+            <label for="speaker">说话人</label>
+            <input id="speaker" placeholder="例如：Vivian" />
+          </div>
+          <div class="row">
+            <label for="customInstruct">指令（可选）</label>
+            <textarea id="customInstruct" placeholder="例如：用非常愤怒的语气"></textarea>
+          </div>
+        </div>
+
+        <div id="designFields" class="hidden">
+          <div class="row">
+            <label for="designInstruct">音色描述</label>
+            <textarea id="designInstruct" placeholder="描述你想要的声音特征..."></textarea>
+          </div>
+        </div>
+
+        <div id="cloneFields" class="hidden">
+          <div class="grid">
+            <div class="row">
+              <label for="userId">用户ID</label>
+              <input id="userId" placeholder="例如：user001" value="user001" />
+              <div class="hint">用于标识不同用户的任务</div>
+            </div>
+            <div class="row">
+              <label for="taskId">任务ID（可选）</label>
+              <input id="taskId" placeholder="不填则自动生成" />
+              <div class="hint">留空自动生成9位短ID</div>
+            </div>
+          </div>
+          <div class="row">
+            <label for="refAudio">参考音频（wav，5–15 秒）</label>
+            <input id="refAudio" type="file" accept="audio/*" />
+          </div>
+          <div class="row">
+            <label for="refText">参考文本</label>
+            <textarea id="refText" placeholder="参考音频对应的文本内容"></textarea>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="generate" class="primary">生成语音</button>
+          <button id="clear" class="secondary">清空内容</button>
+          <button id="viewTasks" class="secondary" style="display:none;">查看我的任务</button>
+        </div>
+
+        <div class="status" id="status"></div>
+        <audio id="audio" controls></audio>
+        
+        <!-- 任务信息显示区域 -->
+        <div id="taskInfo" style="display:none; margin-top:20px; padding:16px; background:#0f1422; border-radius:10px; border:1px solid var(--border);">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+            <div style="font-weight:600; color:#d6dbea;">任务信息</div>
+            <button id="refreshTask" class="icon-btn">刷新状态</button>
+          </div>
+          <div id="taskDetails"></div>
+        </div>
+      </div>
+
+      <!-- 任务管理页面 -->
+      <div id="pageTasks" class="card" style="display:none;">
+        <h2 style="margin-top:0;">任务管理中心</h2>
+        
+        <!-- 用户ID输入 -->
+        <div class="row">
+          <label for="taskMgrUserId">用户ID</label>
+          <input id="taskMgrUserId" placeholder="输入用户ID查看任务" value="user001" />
+        </div>
+        
+        <!-- 操作按钮 -->
+        <div class="actions">
+          <button id="loadAllTasks" class="primary">加载我的任务</button>
+          <button id="refreshAllTasks" class="secondary">刷新列表</button>
+        </div>
+        
+        <!-- 统计信息 -->
+        <div id="taskStats" style="display:none; margin:16px 0; padding:12px; background:#0f1422; border-radius:8px; border:1px solid var(--border);">
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; font-size:13px;">
+            <div>
+              <div style="color:var(--muted);">总任务数</div>
+              <div style="font-size:20px; font-weight:700; color:#74c0fc;" id="statTotal">0</div>
+            </div>
+            <div>
+              <div style="color:var(--muted);">已完成</div>
+              <div style="font-size:20px; font-weight:700; color:#51cf66;" id="statCompleted">0</div>
+            </div>
+            <div>
+              <div style="color:var(--muted);">处理中</div>
+              <div style="font-size:20px; font-weight:700; color:#74c0fc;" id="statProcessing">0</div>
+            </div>
+            <div>
+              <div style="color:var(--muted);">等待中</div>
+              <div style="font-size:20px; font-weight:700; color:#ffa94d;" id="statPending">0</div>
+            </div>
+            <div>
+              <div style="color:var(--muted);">失败</div>
+              <div style="font-size:20px; font-weight:700; color:#ff6b6b;" id="statFailed">0</div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- 任务列表 -->
+        <div id="allTasksList" style="margin-top:20px;"></div>
+        
+        <!-- 任务详情面板 -->
+        <div id="taskDetailPanel" style="display:none; margin-top:20px; padding:16px; background:#0f1422; border-radius:10px; border:1px solid var(--border);">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+            <div style="font-weight:600; color:#d6dbea;">任务详情</div>
+            <button id="closeTaskDetail" class="icon-btn">关闭</button>
+          </div>
+          <div id="taskDetailContent"></div>
+        </div>
+      </div>
+
+      <div class="footer">
+        提示：生成时间与模型大小、文本长度相关。未安装 flash‑attn 时速度会更慢。
+      </div>
+    </div>
+
+    <!-- 任务列表模态窗口 -->
+    <div id="tasksModal" class="modal">
+      <div class="modal-card">
+        <div class="modal-header">
+          <div>
+            <div style="font-weight:700;">我的任务列表</div>
+            <div style="font-size:12px;color:var(--muted);margin-top:4px;">用户: <span id="modalUserId"></span></div>
+          </div>
+          <button id="closeTasks" class="icon-btn">关闭</button>
+        </div>
+        <div class="modal-body">
+          <div id="tasksList" style="min-height:200px;"></div>
+        </div>
+        <div style="margin-top:12px;">
+          <button id="refreshTasks" class="secondary">刷新列表</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const mode = document.getElementById("mode");
+      const modelSize = document.getElementById("modelSize");
+      const customFields = document.getElementById("customFields");
+      const designFields = document.getElementById("designFields");
+      const cloneFields = document.getElementById("cloneFields");
+      const status = document.getElementById("status");
+      const audio = document.getElementById("audio");
+      const speed = document.getElementById("speed");
+      const speedValue = document.getElementById("speedValue");
+      const speedEnabled = document.getElementById("speedEnabled");
+
+      // 全局变量
+      let currentTaskId = null;
+      let currentUserId = null;
+      let taskCheckInterval = null;
+      
+      // 标签页切换
+      const tabGenerate = document.getElementById("tabGenerate");
+      const tabTasks = document.getElementById("tabTasks");
+      const pageGenerate = document.getElementById("pageGenerate");
+      const pageTasks = document.getElementById("pageTasks");
+      
+      tabGenerate.addEventListener("click", () => {
+        tabGenerate.classList.remove("secondary");
+        tabGenerate.classList.add("primary");
+        tabTasks.classList.remove("primary");
+        tabTasks.classList.add("secondary");
+        pageGenerate.style.display = "block";
+        pageTasks.style.display = "none";
+      });
+      
+      tabTasks.addEventListener("click", () => {
+        tabTasks.classList.remove("secondary");
+        tabTasks.classList.add("primary");
+        tabGenerate.classList.remove("primary");
+        tabGenerate.classList.add("secondary");
+        pageGenerate.style.display = "none";
+        pageTasks.style.display = "block";
+        
+        // 切换到任务管理页面时，自动加载任务列表
+        const userId = document.getElementById("taskMgrUserId").value.trim();
+        if (userId) {
+          loadAllUserTasks(userId);
+        }
+      });
+
+      function updateFields() {
+        const m = mode.value;
+        customFields.classList.toggle("hidden", m !== "custom_voice");
+        designFields.classList.toggle("hidden", m !== "voice_design");
+        cloneFields.classList.toggle("hidden", m !== "voice_clone");
+        
+        // 显示/隐藏查看任务按钮
+        const viewTasksBtn = document.getElementById("viewTasks");
+        viewTasksBtn.style.display = m === "voice_clone" ? "block" : "none";
+        
+        if (m !== "voice_clone") {
+          // 清除任务相关状态
+          clearTaskCheck();
+          document.getElementById("taskInfo").style.display = "none";
+        }
+      }
+      
+      function clearTaskCheck() {
+        if (taskCheckInterval) {
+          clearInterval(taskCheckInterval);
+          taskCheckInterval = null;
+        }
+      }
+
+      async function fileToDataUrl(file) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+      }
+
+      mode.addEventListener("change", updateFields);
+      updateFields();
+      speed.addEventListener("input", () => {
+        speedValue.textContent = Number(speed.value).toFixed(2);
+      });
+      speedEnabled.addEventListener("change", () => {
+        speed.disabled = !speedEnabled.checked;
+      });
+      speed.disabled = !speedEnabled.checked;
+
+      document.getElementById("clear").addEventListener("click", () => {
+        document.getElementById("text").value = "";
+        document.getElementById("customInstruct").value = "";
+        document.getElementById("designInstruct").value = "";
+        document.getElementById("refText").value = "";
+        document.getElementById("speaker").value = "";
+        document.getElementById("refAudio").value = "";
+        document.getElementById("taskId").value = "";
+        status.textContent = "";
+        audio.removeAttribute("src");
+        clearTaskCheck();
+        document.getElementById("taskInfo").style.display = "none";
+      });
+
+      document.getElementById("generate").addEventListener("click", async () => {
+        status.textContent = "Generating...";
+        audio.removeAttribute("src");
+        clearTaskCheck();
+
+        const payload = {
+          text: document.getElementById("text").value.trim(),
+          language: document.getElementById("language").value || "Auto",
+          model_size: modelSize.value,
+          speed: speedEnabled.checked ? Number(speed.value) : 1.0,
+          speed_enabled: speedEnabled.checked,
+        };
+
+        let endpoint = "";
+        
+        // 语音克隆模式使用异步任务系统
+        if (mode.value === "voice_clone") {
+          endpoint = "/api/clone";
+          const refAudio = document.getElementById("refAudio").files[0];
+          if (!refAudio) {
+            status.textContent = "请选择参考音频文件";
+            return;
+          }
+          
+          const userId = document.getElementById("userId").value.trim();
+          if (!userId) {
+            status.textContent = "请输入用户ID";
+            return;
+          }
+          
+          const refText = document.getElementById("refText").value.trim();
+          if (!refText) {
+            status.textContent = "请输入参考文本";
+            return;
+          }
+          
+          const taskId = document.getElementById("taskId").value.trim() || null;
+          
+          // 构建异步任务payload
+          payload.user_id = userId;
+          if (taskId) payload.task_id = taskId;
+          payload.ref_audio_b64 = await fileToDataUrl(refAudio);
+          payload.ref_text = refText;
+          payload.lang = document.getElementById("language").value || "English";
+          payload.model = modelSize.value;
+          
+          try {
+            const resp = await fetch(endpoint, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+              status.textContent = "提交失败：" + (data.detail || "未知错误");
+              return;
+            }
+            
+            // 保存任务信息
+            currentTaskId = data.task_id;
+            currentUserId = data.user_id;
+            
+            // 显示提交成功消息，包含队列位置
+            let message = `✅ 任务已提交！\nTask ID: ${data.task_id}\n状态: ${data.status}`;
+            if (data.queue_position) {
+              message += `\n队列位置: 第 ${data.queue_position} 位`;
+            }
+            if (data.message) {
+              message += `\n${data.message}`;
+            }
+            status.textContent = message;
+            
+            // 显示任务信息区域
+            document.getElementById("taskInfo").style.display = "block";
+            
+            // 开始自动查询任务状态
+            checkTaskStatus();
+            taskCheckInterval = setInterval(checkTaskStatus, 3000); // 每3秒查询一次
+            
+          } catch (err) {
+            status.textContent = "请求失败：" + String(err);
+          }
+          return;
+        }
+        
+        // 其他模式使用原来的同步方式
+        if (mode.value === "custom_voice") {
+          endpoint = "/api/custom-voice";
+          payload.speaker = document.getElementById("speaker").value.trim();
+          payload.instruct = document.getElementById("customInstruct").value.trim() || null;
+        } else if (mode.value === "voice_design") {
+          endpoint = "/api/voice-design";
+          payload.instruct = document.getElementById("designInstruct").value.trim();
+        }
+
+        try {
+          const resp = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const data = await resp.json();
+          if (!resp.ok) {
+            status.textContent = data.detail || "Request failed.";
+            return;
+          }
+          audio.src = "data:audio/wav;base64," + data.audio_b64;
+          status.textContent = "Done.";
+        } catch (err) {
+          status.textContent = String(err);
+        }
+      });
+      
+      // ====== 任务管理相关功能 ======
+      
+      // 查询任务状态
+      async function checkTaskStatus() {
+        if (!currentTaskId || !currentUserId) return;
+        
+        try {
+          const resp = await fetch(`/api/task/${currentUserId}/${currentTaskId}`);
+          const task = await resp.json();
+          
+          if (!resp.ok) {
+            updateTaskDisplay(null, "查询失败：" + (task.detail || "未知错误"));
+            clearTaskCheck();
+            return;
+          }
+          
+          updateTaskDisplay(task);
+          
+          // 如果任务完成或失败，停止轮询
+          if (task.status === "completed" || task.status === "failed") {
+            clearTaskCheck();
+            
+            if (task.status === "completed") {
+              status.textContent = "✅ 任务完成！可以下载音频了。";
+            } else {
+              status.textContent = "❌ 任务失败：" + (task.error || "未知错误");
+            }
+          }
+        } catch (err) {
+          updateTaskDisplay(null, "查询失败：" + String(err));
+        }
+      }
+      
+      // 更新任务显示
+      function updateTaskDisplay(task, errorMsg) {
+        const taskDetails = document.getElementById("taskDetails");
+        
+        if (errorMsg) {
+          taskDetails.innerHTML = `<div style="color:#ff6b6b;">${errorMsg}</div>`;
+          return;
+        }
+        
+        if (!task) return;
+        
+        const statusColor = {
+          'pending': '#ffa94d',
+          'processing': '#74c0fc',
+          'completed': '#51cf66',
+          'failed': '#ff6b6b'
+        }[task.status] || '#8a94a6';
+        
+        const statusText = {
+          'pending': '⏳ 等待处理',
+          'processing': '🔄 处理中',
+          'completed': '✅ 已完成',
+          'failed': '❌ 失败'
+        }[task.status] || task.status;
+        
+        let html = `
+          <div style="display:grid; gap:8px; font-size:13px;">
+            <div><span style="color:var(--muted);">任务ID:</span> <code style="background:#1f2635;padding:2px 6px;border-radius:4px;">${task.task_id}</code></div>
+            <div><span style="color:var(--muted);">状态:</span> <span style="color:${statusColor};font-weight:600;">${statusText}</span></div>
+            <div><span style="color:var(--muted);">创建时间:</span> ${task.created_at || 'N/A'}</div>
+        `;
+        
+        if (task.started_at) {
+          html += `<div><span style="color:var(--muted);">开始时间:</span> ${task.started_at}</div>`;
+        }
+        
+        if (task.completed_at) {
+          html += `<div><span style="color:var(--muted);">完成时间:</span> ${task.completed_at}</div>`;
+        }
+        
+        if (task.status === 'completed' && task.audio_url) {
+          const fullUrl = task.audio_url.startsWith('http') ? task.audio_url : (window.location.origin + task.audio_url);
+          html += `
+            <div style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border);">
+              <div style="font-weight:600; margin-bottom:6px;">🎧 试听</div>
+              <audio controls src="${fullUrl}" style="width:100%; margin-bottom:10px;"></audio>
+              <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <a href="${fullUrl}" download style="display:inline-block; padding:8px 16px; background:linear-gradient(135deg, var(--accent), var(--accent-2)); color:#0b0f1a; text-decoration:none; border-radius:8px; font-weight:600;">🎵 下载</a>
+                <button type="button" class="icon-btn" onclick="deleteTaskThenRefresh('${task.user_id}','${task.task_id}','taskInfo')">删除</button>
+                <button type="button" class="icon-btn" onclick="retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button>
+              </div>
+            </div>
+          `;
+        }
+        
+        if (task.error) {
+          html += `<div style="color:#ff6b6b; margin-top:8px;">错误: ${task.error}</div>`;
+        }
+        
+        if (task.status === 'failed' && task.user_id && task.task_id) {
+          html += `
+            <div style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border); display:flex; gap:8px;">
+              <button type="button" class="icon-btn" onclick="deleteTaskThenRefresh('${task.user_id}','${task.task_id}','taskInfo')">删除任务</button>
+              <button type="button" class="icon-btn" onclick="retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button>
+            </div>
+          `;
+        }
+        
+        html += '</div>';
+        taskDetails.innerHTML = html;
+      }
+      
+      async function deleteTaskThenRefresh(userId, taskId, fromPage) {
+        if (!confirm('确定删除该任务吗？')) return;
+        try {
+          const resp = await fetch(`/api/task/${userId}/${taskId}`, { method: 'DELETE' });
+          const data = await resp.json();
+          if (resp.ok) {
+            if (fromPage === 'taskInfo') {
+              document.getElementById('taskInfo').style.display = 'none';
+              currentTaskId = null;
+              currentUserId = null;
+              clearTaskCheck();
+            }
+            if (fromPage === 'tasksModal') {
+              await loadUserTasks(document.getElementById('modalUserId').textContent);
+            }
+            if (fromPage === 'pageTasks') {
+              await loadAllUserTasks(document.getElementById('taskMgrUserId').value.trim());
+              document.getElementById('taskDetailPanel').style.display = 'none';
+            }
+            status.textContent = '已删除任务';
+          } else {
+            alert('删除失败: ' + (data.detail || '未知错误'));
+          }
+        } catch (e) {
+          alert('删除失败: ' + String(e));
+        }
+      }
+      
+      async function retryTaskThenRefresh(userId, taskId) {
+        try {
+          const resp = await fetch(`/api/task/${userId}/${taskId}/retry`, { method: 'POST' });
+          const data = await resp.json();
+          if (resp.ok) {
+            const onTaskPage = document.getElementById('taskDetailPanel').style.display !== 'none';
+            if (onTaskPage) {
+              document.getElementById('taskDetailPanel').style.display = 'none';
+              await loadAllUserTasks(document.getElementById('taskMgrUserId').value.trim());
+            } else {
+              currentTaskId = data.task_id;
+              currentUserId = data.user_id;
+              status.textContent = '已重新提交，新任务ID: ' + data.task_id;
+              document.getElementById('taskInfo').style.display = 'block';
+              updateTaskDisplay({ task_id: data.task_id, user_id: data.user_id, status: 'pending', created_at: new Date().toISOString() });
+              taskCheckInterval = setInterval(checkTaskStatus, 3000);
+            }
+            if (onTaskPage) {
+              alert('已重新提交，新任务ID: ' + data.task_id + '\n任务列表已刷新。');
+            }
+          } else {
+            alert('重试失败: ' + (data.detail || '未知错误'));
+          }
+        } catch (e) {
+          alert('重试失败: ' + String(e));
+        }
+      }
+      
+      // 刷新任务状态按钮
+      document.getElementById("refreshTask").addEventListener("click", () => {
+        checkTaskStatus();
+      });
+      
+      // 查看任务列表
+      document.getElementById("viewTasks").addEventListener("click", async () => {
+        const userId = document.getElementById("userId").value.trim();
+        if (!userId) {
+          alert("请先输入用户ID");
+          return;
+        }
+        
+        document.getElementById("modalUserId").textContent = userId;
+        document.getElementById("tasksModal").classList.add("open");
+        await loadUserTasks(userId);
+      });
+      
+      // 关闭任务列表
+      document.getElementById("closeTasks").addEventListener("click", () => {
+        document.getElementById("tasksModal").classList.remove("open");
+      });
+      
+      // 刷新任务列表
+      document.getElementById("refreshTasks").addEventListener("click", async () => {
+        const userId = document.getElementById("modalUserId").textContent;
+        await loadUserTasks(userId);
+      });
+      
+      // 加载用户任务列表
+      async function loadUserTasks(userId) {
+        const tasksList = document.getElementById("tasksList");
+        tasksList.innerHTML = '<div style="text-align:center;color:var(--muted);">加载中...</div>';
+        
+        try {
+          const resp = await fetch(`/api/tasks/${userId}`);
+          const data = await resp.json();
+          
+          if (!resp.ok) {
+            tasksList.innerHTML = `<div style="color:#ff6b6b;">加载失败: ${data.detail || '未知错误'}</div>`;
+            return;
+          }
+          
+          if (data.total === 0) {
+            tasksList.innerHTML = '<div style="text-align:center;color:var(--muted);">暂无任务</div>';
+            return;
+          }
+          
+          const fullUrl = (url) => url && (url.startsWith('http') ? url : (window.location.origin + url));
+          let html = '<table style="width:100%;"><thead><tr><th>任务ID</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>';
+          
+          data.tasks.forEach(task => {
+            const statusColor = {
+              'pending': '#ffa94d',
+              'processing': '#74c0fc',
+              'completed': '#51cf66',
+              'failed': '#ff6b6b'
+            }[task.status] || '#8a94a6';
+            const audioLink = task.status === 'completed' && task.audio_url ? fullUrl(task.audio_url) : '';
+            let actions = '';
+            if (task.status === 'completed' && audioLink) {
+              actions = `<a href="${audioLink}" class="icon-btn" target="_blank">试听</a> <a href="${audioLink}" class="icon-btn" download>下载</a> `;
+            }
+            if (task.status === 'failed' || task.status === 'completed') {
+              actions += `<button type="button" class="icon-btn" onclick="deleteTaskThenRefresh('${task.user_id}','${task.task_id}','tasksModal')">删除</button>`;
+              if (task.status === 'failed' || task.status === 'completed') {
+                actions += ` <button type="button" class="icon-btn" onclick="retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button>`;
+              }
+            }
+            if (!actions) actions = '<span style="color:var(--muted);font-size:11px;">-</span>';
+            
+            html += `
+              <tr>
+                <td><code style="font-size:11px;">${task.task_id}</code></td>
+                <td><span style="color:${statusColor};">${task.status}</span></td>
+                <td style="font-size:12px;">${new Date(task.created_at).toLocaleString()}</td>
+                <td style="white-space:nowrap;">${actions}</td>
+              </tr>
+            `;
+          });
+          
+          html += '</tbody></table>';
+          tasksList.innerHTML = html;
+          
+        } catch (err) {
+          tasksList.innerHTML = `<div style="color:#ff6b6b;">加载失败: ${String(err)}</div>`;
+        }
+      }
+      
+      // ====== 任务管理页面功能 ======
+      
+      // 加载所有任务
+      document.getElementById("loadAllTasks").addEventListener("click", async () => {
+        const userId = document.getElementById("taskMgrUserId").value.trim();
+        if (!userId) {
+          alert("请输入用户ID");
+          return;
+        }
+        await loadAllUserTasks(userId);
+      });
+      
+      // 刷新任务列表
+      document.getElementById("refreshAllTasks").addEventListener("click", async () => {
+        const userId = document.getElementById("taskMgrUserId").value.trim();
+        if (userId) {
+          await loadAllUserTasks(userId);
+        }
+      });
+      
+      // 关闭任务详情
+      document.getElementById("closeTaskDetail").addEventListener("click", () => {
+        document.getElementById("taskDetailPanel").style.display = "none";
+      });
+      
+      // 加载用户所有任务（任务管理页面）
+      async function loadAllUserTasks(userId) {
+        const tasksList = document.getElementById("allTasksList");
+        const taskStats = document.getElementById("taskStats");
+        tasksList.innerHTML = '<div style="text-align:center;color:var(--muted);padding:20px;">加载中...</div>';
+        taskStats.style.display = "none";
+        
+        try {
+          const resp = await fetch(`/api/tasks/${userId}`);
+          const data = await resp.json();
+          
+          if (!resp.ok) {
+            tasksList.innerHTML = `<div style="color:#ff6b6b;padding:20px;">加载失败: ${data.detail || '未知错误'}</div>`;
+            return;
+          }
+          
+          if (data.total === 0) {
+            tasksList.innerHTML = '<div style="text-align:center;color:var(--muted);padding:40px;">暂无任务<br><br>切换到"语音生成"页面创建第一个任务</div>';
+            return;
+          }
+          
+          // 显示统计信息
+          const stats = {
+            total: data.total,
+            completed: 0,
+            processing: 0,
+            pending: 0,
+            failed: 0
+          };
+          
+          data.tasks.forEach(task => {
+            if (task.status === 'completed') stats.completed++;
+            else if (task.status === 'processing') stats.processing++;
+            else if (task.status === 'pending') stats.pending++;
+            else if (task.status === 'failed') stats.failed++;
+          });
+          
+          document.getElementById("statTotal").textContent = stats.total;
+          document.getElementById("statCompleted").textContent = stats.completed;
+          document.getElementById("statProcessing").textContent = stats.processing;
+          document.getElementById("statPending").textContent = stats.pending;
+          document.getElementById("statFailed").textContent = stats.failed;
+          taskStats.style.display = "block";
+          
+          // 渲染任务列表
+          let html = '<div style="overflow-x:auto;"><table style="width:100%;"><thead><tr>';
+          html += '<th style="width:120px;">任务ID</th>';
+          html += '<th style="width:90px;">状态</th>';
+          html += '<th>合成文本</th>';
+          html += '<th style="width:150px;">创建时间</th>';
+          html += '<th style="width:120px;">操作</th>';
+          html += '</tr></thead><tbody>';
+          
+          data.tasks.forEach(task => {
+            const statusColor = {
+              'pending': '#ffa94d',
+              'processing': '#74c0fc',
+              'completed': '#51cf66',
+              'failed': '#ff6b6b'
+            }[task.status] || '#8a94a6';
+            
+            const statusText = {
+              'pending': '⏳ 等待',
+              'processing': '🔄 处理中',
+              'completed': '✅ 完成',
+              'failed': '❌ 失败'
+            }[task.status] || task.status;
+            
+            // 获取合成文本（截取前30个字符）
+            const text = task.params?.text || 'N/A';
+            const shortText = text.length > 30 ? text.substring(0, 30) + '...' : text;
+            
+            const audioLink = task.status === 'completed' && task.audio_url
+              ? (task.audio_url.startsWith('http') ? task.audio_url : (window.location.origin + task.audio_url))
+              : '';
+            let actions = '';
+            if (task.status === 'completed' && audioLink) {
+              actions = `<a href="${audioLink}" class="icon-btn" target="_blank" onclick="event.stopPropagation();">试听</a> <a href="${audioLink}" class="icon-btn" download onclick="event.stopPropagation();">下载</a> `;
+            } else if (task.status === 'processing' || task.status === 'pending') {
+              actions = '<span style="color:var(--muted);font-size:11px;">处理中</span>';
+            }
+            if (task.status === 'failed' || task.status === 'completed') {
+              actions += `<button type="button" class="icon-btn" onclick="event.stopPropagation(); deleteTaskThenRefresh('${userId}','${task.task_id}','pageTasks')">删除</button>`;
+              actions += ` <button type="button" class="icon-btn" onclick="event.stopPropagation(); retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button>`;
+            }
+            if (!actions) actions = '<span style="color:var(--muted);font-size:11px;">-</span>';
+            
+            html += `
+              <tr style="cursor:pointer;" onclick="showTaskDetail('${userId}', '${task.task_id}')">
+                <td><code style="font-size:11px;">${task.task_id}</code></td>
+                <td><span style="color:${statusColor};font-weight:600;font-size:12px;">${statusText}</span></td>
+                <td style="font-size:12px;">${shortText}</td>
+                <td style="font-size:11px;color:var(--muted);">${new Date(task.created_at).toLocaleString()}</td>
+                <td style="white-space:nowrap;">${actions}</td>
+              </tr>
+            `;
+          });
+          
+          html += '</tbody></table></div>';
+          tasksList.innerHTML = html;
+          
+        } catch (err) {
+          tasksList.innerHTML = `<div style="color:#ff6b6b;padding:20px;">加载失败: ${String(err)}</div>`;
+        }
+      }
+      
+      // 显示任务详情
+      async function showTaskDetail(userId, taskId) {
+        const detailPanel = document.getElementById("taskDetailPanel");
+        const detailContent = document.getElementById("taskDetailContent");
+        
+        detailPanel.style.display = "block";
+        detailContent.innerHTML = '<div style="text-align:center;color:var(--muted);">加载中...</div>';
+        
+        try {
+          const resp = await fetch(`/api/task/${userId}/${taskId}`);
+          const task = await resp.json();
+          
+          if (!resp.ok) {
+            detailContent.innerHTML = `<div style="color:#ff6b6b;">加载失败: ${task.detail || '未知错误'}</div>`;
+            return;
+          }
+          
+          const statusColor = {
+            'pending': '#ffa94d',
+            'processing': '#74c0fc',
+            'completed': '#51cf66',
+            'failed': '#ff6b6b'
+          }[task.status] || '#8a94a6';
+          
+          const statusText = {
+            'pending': '⏳ 等待处理',
+            'processing': '🔄 处理中',
+            'completed': '✅ 已完成',
+            'failed': '❌ 失败'
+          }[task.status] || task.status;
+          
+          let html = '<div style="display:grid; gap:12px; font-size:13px;">';
+          
+          // 基本信息
+          html += `
+            <div style="display:grid; grid-template-columns:120px 1fr; gap:8px;">
+              <span style="color:var(--muted);">任务ID:</span>
+              <code style="background:#1f2635;padding:4px 8px;border-radius:4px;">${task.task_id}</code>
+            </div>
+            <div style="display:grid; grid-template-columns:120px 1fr; gap:8px;">
+              <span style="color:var(--muted);">用户ID:</span>
+              <span>${task.user_id}</span>
+            </div>
+            <div style="display:grid; grid-template-columns:120px 1fr; gap:8px;">
+              <span style="color:var(--muted);">状态:</span>
+              <span style="color:${statusColor};font-weight:600;">${statusText}</span>
+            </div>
+          `;
+          
+          // 时间信息
+          html += `
+            <div style="display:grid; grid-template-columns:120px 1fr; gap:8px;">
+              <span style="color:var(--muted);">创建时间:</span>
+              <span>${new Date(task.created_at).toLocaleString()}</span>
+            </div>
+          `;
+          
+          if (task.started_at) {
+            html += `
+              <div style="display:grid; grid-template-columns:120px 1fr; gap:8px;">
+                <span style="color:var(--muted);">开始时间:</span>
+                <span>${new Date(task.started_at).toLocaleString()}</span>
+              </div>
+            `;
+          }
+          
+          if (task.completed_at) {
+            html += `
+              <div style="display:grid; grid-template-columns:120px 1fr; gap:8px;">
+                <span style="color:var(--muted);">完成时间:</span>
+                <span>${new Date(task.completed_at).toLocaleString()}</span>
+              </div>
+            `;
+          }
+          
+          // 参数信息
+          if (task.params) {
+            html += '<div style="margin-top:8px; padding-top:12px; border-top:1px solid var(--border);">';
+            html += '<div style="font-weight:600; margin-bottom:8px;">任务参数</div>';
+            
+            if (task.params.text) {
+              html += `
+                <div style="margin-bottom:8px;">
+                  <div style="color:var(--muted);font-size:11px;">合成文本:</div>
+                  <div style="background:#1f2635;padding:8px;border-radius:4px;margin-top:4px;font-size:12px;">${task.params.text}</div>
+                </div>
+              `;
+            }
+            
+            if (task.params.ref_text && task.params.ref_text !== '[已隐藏]') {
+              html += `
+                <div style="margin-bottom:8px;">
+                  <div style="color:var(--muted);font-size:11px;">参考文本:</div>
+                  <div style="background:#1f2635;padding:8px;border-radius:4px;margin-top:4px;font-size:12px;">${task.params.ref_text}</div>
+                </div>
+              `;
+            }
+            
+            html += `
+              <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-top:8px;">
+                <div>
+                  <div style="color:var(--muted);font-size:11px;">语速:</div>
+                  <div style="font-weight:600;">${task.params.speed || 1.0}</div>
+                </div>
+                <div>
+                  <div style="color:var(--muted);font-size:11px;">语言:</div>
+                  <div style="font-weight:600;">${task.params.lang || 'English'}</div>
+                </div>
+                <div>
+                  <div style="color:var(--muted);font-size:11px;">模型:</div>
+                  <div style="font-weight:600;">${task.params.model || '1.7B'}</div>
+                </div>
+              </div>
+            `;
+            
+            html += '</div>';
+          }
+          
+          // 试听与下载
+          if (task.status === 'completed' && task.audio_url) {
+            const fullUrl = task.audio_url.startsWith('http') ? task.audio_url : (window.location.origin + task.audio_url);
+            html += `
+              <div style="margin-top:12px; padding-top:12px; border-top:1px solid var(--border);">
+                <div style="font-weight:600; margin-bottom:6px;">🎧 试听</div>
+                <audio controls src="${fullUrl}" style="width:100%; margin-bottom:10px;"></audio>
+                <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+                  <a href="${fullUrl}" download style="display:inline-block; padding:10px 20px; background:linear-gradient(135deg, var(--accent), var(--accent-2)); color:#0b0f1a; text-decoration:none; border-radius:8px; font-weight:600;">🎵 下载</a>
+                  <button type="button" class="icon-btn" onclick="deleteTaskThenRefresh('${task.user_id}','${task.task_id}','pageTasks')">删除任务</button>
+                  <button type="button" class="icon-btn" onclick="retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button>
+                </div>
+                <div style="margin-top:8px; font-size:11px; color:var(--muted);">采样率: ${task.sample_rate || 24000} Hz</div>
+              </div>
+            `;
+          }
+          
+          // 失败任务的删除与重试
+          if (task.status === 'failed') {
+            html += `
+              <div style="margin-top:12px; padding-top:12px; border-top:1px solid var(--border); display:flex; gap:8px;">
+                <button type="button" class="icon-btn" onclick="deleteTaskThenRefresh('${task.user_id}','${task.task_id}','pageTasks')">删除任务</button>
+                <button type="button" class="icon-btn" onclick="retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button>
+              </div>
+            `;
+          }
+          
+          // 错误信息
+          if (task.error) {
+            html += `
+              <div style="margin-top:12px; padding:12px; background:#3d1a1a; border-left:3px solid #ff6b6b; border-radius:4px;">
+                <div style="color:#ff6b6b; font-weight:600; margin-bottom:4px;">错误信息</div>
+                <div style="color:#ffb3b3; font-size:12px;">${task.error}</div>
+              </div>
+            `;
+          }
+          
+          html += '</div>';
+          detailContent.innerHTML = html;
+          
+        } catch (err) {
+          detailContent.innerHTML = `<div style="color:#ff6b6b;">加载失败: ${String(err)}</div>`;
+        }
+      }
+    </script>
+  </body>
+</html>

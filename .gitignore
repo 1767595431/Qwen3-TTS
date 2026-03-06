@@ -1,0 +1,50 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.idea/
+.vscode/
+venv/
+env/
+
+# Model weights & tokenizer files (too large for git)
+models/
+*.safetensors
+*.pt
+*.bin
+*.onnx
+*.tar
+
+# SenseVoice ASR model & cache
+SenseVoiceSmall/model.pt
+SenseVoiceSmall/cache/
+SenseVoiceSmall/*.model
+
+# Runtime generated audio & task data
+tasks/audio/
+tasks/*.json
+
+# Large assets
+assets/*.pdf
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+*.ogg

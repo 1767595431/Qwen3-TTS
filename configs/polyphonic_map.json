@@ -1,0 +1,14 @@
+{
+  "说服": {
+    "replace": "税服",
+    "pinyin": "[shui4,fu2]"
+  },
+  "银行": {
+    "replace": "因航",
+    "pinyin": "[yin2,hang2]"
+  },
+  "浩浩汤汤": {
+    "replace": "浩浩膛膛",
+    "pinyin": "[tang1,tang1]"
+  }
+}
