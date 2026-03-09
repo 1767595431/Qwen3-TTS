@@ -85,6 +85,58 @@
       }
       .icon-btn:hover { background: rgba(110, 168, 255, 0.1); border-color: var(--accent); }
       td .icon-btn { padding: 4px 8px; }
+      .subtitle-widget {
+        margin-top: 12px;
+        padding: 12px;
+        background: #0b1020;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+      }
+      .subtitle-toolbar {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+        margin-bottom: 10px;
+      }
+      .subtitle-scroll {
+        max-height: 240px;
+        overflow-y: auto;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: #0f1422;
+        padding: 8px;
+      }
+      .subtitle-line {
+        padding: 8px 10px;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: background 0.2s ease, color 0.2s ease;
+        margin-bottom: 6px;
+      }
+      .subtitle-line:last-child { margin-bottom: 0; }
+      .subtitle-line:hover { background: rgba(110, 168, 255, 0.08); }
+      .subtitle-line.active {
+        background: rgba(110, 168, 255, 0.16);
+        border: 1px solid rgba(110, 168, 255, 0.35);
+      }
+      .subtitle-time { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+      .subtitle-text { font-size: 13px; line-height: 1.55; }
+      .subtitle-empty {
+        color: var(--muted);
+        font-size: 12px;
+        text-align: center;
+        padding: 16px 8px;
+      }
+      .subtitle-warning {
+        margin-bottom: 10px;
+        padding: 10px;
+        border-radius: 8px;
+        background: rgba(255, 107, 107, 0.08);
+        border: 1px solid rgba(255, 107, 107, 0.2);
+        color: #ffb3b3;
+        font-size: 12px;
+      }
       @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } .actions { flex-direction: column; } }
     </style>
   </head>
@@ -157,7 +209,7 @@
         <div class="row">
           <label for="refAudio">参考音频（wav/mp3/m4a 等）</label>
           <input id="refAudio" type="file" accept="audio/*" />
-          <div class="hint">参考音频须 5–15 秒，上传后降噪并识别参考文本</div>
+          <div class="hint">参考音频须 3–15 秒，上传后自动识别参考文本</div>
         </div>
         <div class="row">
           <label for="refText">参考文本</label>
@@ -172,6 +224,7 @@
 
         <div class="status" id="status"></div>
         <audio id="audio" controls></audio>
+        <div id="previewSubtitlePanel" style="display:none; margin-top:16px;"></div>
 
         <div id="taskInfo" style="display:none; margin-top:20px; padding:16px; background:#0f1422; border-radius:10px; border:1px solid var(--border);">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
@@ -232,6 +285,21 @@
       </div>
     </div>
 
+    <div id="previewModal" class="modal">
+      <div class="modal-card" style="width:min(860px, 94vw);">
+        <div class="modal-header">
+          <div>
+            <div style="font-weight:700;">任务试听</div>
+            <div id="previewModalMeta" style="font-size:12px;color:var(--muted);margin-top:4px;"></div>
+          </div>
+          <button id="closePreviewModal" class="icon-btn">关闭</button>
+        </div>
+        <div class="modal-body">
+          <div id="previewModalContent"></div>
+        </div>
+      </div>
+    </div>
+
     <script>
       const modelSize = document.getElementById("modelSize");
       const status = document.getElementById("status");
@@ -248,6 +316,191 @@
       const tabTasks = document.getElementById("tabTasks");
       const pageGenerate = document.getElementById("pageGenerate");
       const pageTasks = document.getElementById("pageTasks");
+      const previewSubtitlePanel = document.getElementById("previewSubtitlePanel");
+      const previewModal = document.getElementById("previewModal");
+      const previewModalMeta = document.getElementById("previewModalMeta");
+      const previewModalContent = document.getElementById("previewModalContent");
+      let subtitleViewSeq = 0;
+      const subtitleBindings = new Map();
+
+      function fullUrl(url) {
+        return url && (url.startsWith("http") ? url : (window.location.origin + url));
+      }
+
+      function escapeHtml(value) {
+        return String(value ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
+
+      function createMountId(prefix = "subtitle") {
+        subtitleViewSeq += 1;
+        return `${prefix}-${subtitleViewSeq}`;
+      }
+
+      function cleanupSubtitleBinding(audioElementId) {
+        const binding = subtitleBindings.get(audioElementId);
+        if (!binding) return;
+        binding.listeners.forEach(([eventName, handler]) => binding.audioEl.removeEventListener(eventName, handler));
+        subtitleBindings.delete(audioElementId);
+      }
+
+      function clearPreviewSubtitle() {
+        cleanupSubtitleBinding("audio");
+        previewSubtitlePanel.style.display = "none";
+        previewSubtitlePanel.innerHTML = "";
+      }
+
+      function closeTaskPreviewModal() {
+        cleanupSubtitleBinding("previewModalAudio");
+        previewModal.classList.remove("open");
+        previewModalMeta.textContent = "";
+        previewModalContent.innerHTML = "";
+      }
+
+      function normalizeSubtitleSegments(subtitleJsonData) {
+        return (subtitleJsonData?.segments || [])
+          .map((seg) => ({
+            start: Number(seg.start || 0),
+            end: Number(seg.end || 0),
+            text: String(seg.text || "").trim(),
+          }))
+          .filter((seg) => seg.text);
+      }
+
+      function formatSubtitleTime(seconds) {
+        const safe = Math.max(0, Number(seconds || 0));
+        const hours = Math.floor(safe / 3600);
+        const minutes = Math.floor((safe % 3600) / 60);
+        const secs = Math.floor(safe % 60);
+        const millis = Math.round((safe - Math.floor(safe)) * 1000);
+        return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+      }
+
+      function buildSubtitleWidgetMarkup(mountId, options = {}) {
+        const buttons = [];
+        if (options.audioDownloadUrl) buttons.push(`<a href="${options.audioDownloadUrl}" download="${options.audioDownloadName || "audio.wav"}" class="icon-btn">下载音频</a>`);
+        if (options.subtitleSrtUrl) buttons.push(`<a href="${options.subtitleSrtUrl}" download="${options.subtitleSrtName || "subtitle.srt"}" class="icon-btn">下载 SRT</a>`);
+        if (options.subtitleJsonUrl) buttons.push(`<a href="${options.subtitleJsonUrl}" download="${options.subtitleJsonName || "subtitle.json"}" class="icon-btn">下载 JSON</a>`);
+        return `
+          <div class="subtitle-widget">
+            <div style="font-weight:600; margin-bottom:8px;">字幕</div>
+            ${options.subtitleError ? `<div class="subtitle-warning">${escapeHtml(options.subtitleError)}</div>` : ""}
+            <div class="subtitle-toolbar">${buttons.join("") || '<span class="hint">暂无可下载文件</span>'}</div>
+            <div class="subtitle-scroll" id="${mountId}-scroll">
+              <div class="subtitle-empty" id="${mountId}-empty">字幕加载中...</div>
+              <div id="${mountId}-list"></div>
+            </div>
+          </div>
+        `;
+      }
+
+      async function mountSubtitleWidget({ mountId, audioElementId, subtitleJsonUrl = null }) {
+        const audioEl = document.getElementById(audioElementId);
+        const listEl = document.getElementById(`${mountId}-list`);
+        const emptyEl = document.getElementById(`${mountId}-empty`);
+        if (!audioEl || !listEl || !emptyEl || !subtitleJsonUrl) {
+          if (emptyEl) emptyEl.textContent = "暂无可用字幕";
+          return;
+        }
+
+        cleanupSubtitleBinding(audioElementId);
+
+        let payload;
+        try {
+          const resp = await fetch(fullUrl(subtitleJsonUrl));
+          payload = await resp.json();
+          if (!resp.ok) throw new Error(payload.detail || "字幕加载失败");
+        } catch (err) {
+          emptyEl.textContent = "字幕加载失败：" + String(err);
+          return;
+        }
+
+        const segments = normalizeSubtitleSegments(payload);
+        if (!segments.length) {
+          emptyEl.textContent = "暂无可用字幕";
+          return;
+        }
+
+        emptyEl.style.display = "none";
+        listEl.innerHTML = segments.map((seg, index) => `
+          <div class="subtitle-line" data-index="${index}" data-start="${seg.start}" data-end="${seg.end}">
+            <div class="subtitle-time">${formatSubtitleTime(seg.start)} - ${formatSubtitleTime(seg.end)}</div>
+            <div class="subtitle-text">${escapeHtml(seg.text)}</div>
+          </div>
+        `).join("");
+
+        const items = Array.from(listEl.querySelectorAll(".subtitle-line"));
+        let activeIndex = -1;
+
+        const syncActiveSubtitle = () => {
+          const currentTime = audioEl.currentTime || 0;
+          let nextIndex = -1;
+          for (let i = 0; i < items.length; i += 1) {
+            const start = Number(items[i].dataset.start);
+            const end = Number(items[i].dataset.end);
+            if (currentTime >= start && currentTime <= end + 0.08) {
+              nextIndex = i;
+              break;
+            }
+          }
+          if (activeIndex === nextIndex) return;
+          items.forEach((item) => item.classList.remove("active"));
+          activeIndex = nextIndex;
+          if (activeIndex >= 0) {
+            items[activeIndex].classList.add("active");
+            items[activeIndex].scrollIntoView({ block: "nearest", behavior: "smooth" });
+          }
+        };
+
+        const clearActiveSubtitle = () => {
+          items.forEach((item) => item.classList.remove("active"));
+          activeIndex = -1;
+        };
+
+        items.forEach((item) => {
+          item.addEventListener("click", () => {
+            audioEl.currentTime = Number(item.dataset.start || 0);
+            audioEl.play();
+          });
+        });
+
+        const listeners = [
+          ["timeupdate", syncActiveSubtitle],
+          ["seeked", syncActiveSubtitle],
+          ["loadedmetadata", syncActiveSubtitle],
+          ["ended", clearActiveSubtitle],
+        ];
+        listeners.forEach(([eventName, handler]) => audioEl.addEventListener(eventName, handler));
+        subtitleBindings.set(audioElementId, { audioEl, listeners });
+        syncActiveSubtitle();
+      }
+
+      function renderPreviewSubtitle(task) {
+        if (!task || task.status !== "completed" || !task.audio_url) {
+          clearPreviewSubtitle();
+          return;
+        }
+        const mountId = createMountId("preview-subtitle");
+        previewSubtitlePanel.innerHTML = buildSubtitleWidgetMarkup(mountId, {
+          audioDownloadUrl: fullUrl(task.audio_url),
+          audioDownloadName: `${task.task_id || "audio"}.wav`,
+          subtitleSrtUrl: task.subtitle_srt ? fullUrl(task.subtitle_srt) : "",
+          subtitleSrtName: `${task.task_id || "audio"}.srt`,
+          subtitleJsonUrl: task.subtitle_json ? fullUrl(task.subtitle_json) : "",
+          subtitleJsonName: `${task.task_id || "audio"}_subtitle.json`,
+          subtitleError: task.subtitle_error || "",
+        });
+        previewSubtitlePanel.style.display = "block";
+        mountSubtitleWidget({
+          mountId,
+          audioElementId: "audio",
+          subtitleJsonUrl: task.subtitle_json || null,
+        });
+      }
 
       tabGenerate.addEventListener("click", () => {
         tabGenerate.classList.add("primary"); tabGenerate.classList.remove("secondary");
@@ -270,12 +523,12 @@
         const file = e.target.files?.[0];
         if (!file) return;
         const prevStatus = status.textContent;
-        status.textContent = "🔄 降噪并识别参考文本中...";
+        status.textContent = "🔄 WhisperX 识别参考文本中...";
         try {
           const resp = await fetch("/api/asr/status");
           const st = await resp.json();
           if (!st.available) {
-            status.textContent = "⚠️ SenseVoice 未安装，请手动输入参考文本。安装: pip install -U funasr modelscope";
+            status.textContent = "⚠️ WhisperX 未安装，请手动输入参考文本。安装: pip install whisperx";
             return;
           }
           const formData = new FormData();
@@ -308,6 +561,7 @@
         document.getElementById("taskId").value = "";
         status.textContent = "";
         audio.removeAttribute("src");
+        clearPreviewSubtitle();
         clearTaskCheck();
         document.getElementById("taskInfo").style.display = "none";
       });
@@ -315,6 +569,7 @@
       document.getElementById("generate").addEventListener("click", async () => {
         status.textContent = "提交中...";
         audio.removeAttribute("src");
+        clearPreviewSubtitle();
         clearTaskCheck();
         document.getElementById("taskInfo").style.display = "none";
 
@@ -322,7 +577,7 @@
         if (!refAudio) { status.textContent = "请选择参考音频文件"; return; }
         const refText = document.getElementById("refText").value.trim();
         if (!refText) { status.textContent = "请输入参考文本"; return; }
-        const text = document.getElementById("text").value.trim();
+        const text = document.getElementById("text").value.replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
         if (!text) { status.textContent = "请输入要合成的文本"; return; }
         
         const userId = document.getElementById("userId").value.trim();
@@ -401,11 +656,11 @@
           } else if (task.status === "completed") {
             clearTaskCheck();
             status.textContent = `✅ 任务完成！\n任务ID: ${task.task_id}\n\n👇 请在下方试听和下载`;
-            // 自动播放音频
-            const fullUrl = task.audio_url.startsWith('http') ? task.audio_url : (window.location.origin + task.audio_url);
-            audio.src = fullUrl;
+            audio.src = fullUrl(task.audio_url);
+            renderPreviewSubtitle(task);
           } else if (task.status === "failed") {
             clearTaskCheck();
+            clearPreviewSubtitle();
             status.textContent = `❌ 任务失败\n任务ID: ${task.task_id}\n错误: ${task.error || "未知错误"}`;
           }
         } catch (err) {
@@ -427,17 +682,30 @@
         `;
         if (task.started_at) html += `<div><span style="color:var(--muted);">开始时间:</span> ${task.started_at}</div>`;
         if (task.completed_at) html += `<div><span style="color:var(--muted);">完成时间:</span> ${task.completed_at}</div>`;
+        let subtitleMountId = null;
         if (task.status === 'completed' && task.audio_url) {
-          const fullUrl = task.audio_url.startsWith('http') ? task.audio_url : (window.location.origin + task.audio_url);
+          const audioUrl = fullUrl(task.audio_url);
+          const subtitleSrtUrl = task.subtitle_srt ? fullUrl(task.subtitle_srt) : '';
+          const subtitleJsonUrl = task.subtitle_json ? fullUrl(task.subtitle_json) : '';
+          subtitleMountId = createMountId("task-info-subtitle");
           html += `
             <div style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border);">
               <div style="font-weight:600; margin-bottom:6px;">🎧 试听</div>
-              <audio controls src="${fullUrl}" style="width:100%; margin-bottom:10px;"></audio>
+              <audio id="${subtitleMountId}-audio" controls src="${audioUrl}" style="width:100%; margin-bottom:10px;"></audio>
               <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                <a href="${fullUrl}" download style="display:inline-block; padding:8px 16px; background:linear-gradient(135deg, var(--accent), var(--accent-2)); color:#0b0f1a; text-decoration:none; border-radius:8px; font-weight:600;">🎵 下载</a>
+                <a href="${audioUrl}" download style="display:inline-block; padding:8px 16px; background:linear-gradient(135deg, var(--accent), var(--accent-2)); color:#0b0f1a; text-decoration:none; border-radius:8px; font-weight:600;">🎵 下载</a>
+                ${subtitleSrtUrl ? `<a href="${subtitleSrtUrl}" download class="icon-btn">下载 SRT</a>` : ''}
+                ${subtitleJsonUrl ? `<a href="${subtitleJsonUrl}" download class="icon-btn">下载 JSON</a>` : ''}
                 <button type="button" class="icon-btn" onclick="deleteTaskThenRefresh('${task.user_id}','${task.task_id}','taskInfo')">删除</button>
                 <button type="button" class="icon-btn" onclick="retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button>
               </div>
+              ${buildSubtitleWidgetMarkup(subtitleMountId, {
+                subtitleSrtUrl,
+                subtitleSrtName: `${task.task_id}.srt`,
+                subtitleJsonUrl,
+                subtitleJsonName: `${task.task_id}_subtitle.json`,
+                subtitleError: task.subtitle_error || "",
+              })}
             </div>
           `;
         }
@@ -450,6 +718,13 @@
         }
         html += '</div>';
         taskDetails.innerHTML = html;
+        if (subtitleMountId) {
+          mountSubtitleWidget({
+            mountId: subtitleMountId,
+            audioElementId: `${subtitleMountId}-audio`,
+            subtitleJsonUrl: task.subtitle_json || null,
+          });
+        }
       }
 
       async function deleteTaskThenRefresh(userId, taskId, fromPage) {
@@ -504,9 +779,61 @@
         await loadUserTasks(userId);
       });
       document.getElementById("closeTasks").addEventListener("click", () => document.getElementById("tasksModal").classList.remove("open"));
+      document.getElementById("closePreviewModal").addEventListener("click", closeTaskPreviewModal);
       document.getElementById("refreshTasks").addEventListener("click", async () => {
         await loadUserTasks(document.getElementById("modalUserId").textContent);
       });
+
+      async function openTaskPreview(userId, taskId) {
+        previewModal.classList.add("open");
+        previewModalMeta.textContent = `任务ID: ${taskId}`;
+        previewModalContent.innerHTML = '<div style="text-align:center;color:var(--muted);padding:20px;">加载中...</div>';
+
+        try {
+          const resp = await fetch(`/api/task/${userId}/${taskId}`);
+          const task = await resp.json();
+          if (!resp.ok) {
+            previewModalContent.innerHTML = `<div style="color:#ff6b6b;">加载失败: ${task.detail || '未知错误'}</div>`;
+            return;
+          }
+          if (task.status !== "completed" || !task.audio_url) {
+            previewModalContent.innerHTML = `<div style="color:#ff6b6b;">该任务尚未完成，当前状态：${escapeHtml(task.status || "unknown")}</div>`;
+            return;
+          }
+
+          const audioUrl = fullUrl(task.audio_url);
+          const subtitleSrtUrl = task.subtitle_srt ? fullUrl(task.subtitle_srt) : '';
+          const subtitleJsonUrl = task.subtitle_json ? fullUrl(task.subtitle_json) : '';
+          const mountId = createMountId("preview-modal-subtitle");
+
+          previewModalMeta.textContent = `任务ID: ${task.task_id} · 用户: ${task.user_id} · 采样率: ${task.sample_rate || 24000} Hz`;
+          previewModalContent.innerHTML = `
+            <div style="display:grid; gap:12px;">
+              <audio id="previewModalAudio" controls autoplay src="${audioUrl}" style="width:100%;"></audio>
+              <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <a href="${audioUrl}" download class="icon-btn">下载音频</a>
+                ${subtitleSrtUrl ? `<a href="${subtitleSrtUrl}" download class="icon-btn">下载 SRT</a>` : ''}
+                ${subtitleJsonUrl ? `<a href="${subtitleJsonUrl}" download class="icon-btn">下载 JSON</a>` : ''}
+              </div>
+              ${buildSubtitleWidgetMarkup(mountId, {
+                subtitleSrtUrl,
+                subtitleSrtName: `${task.task_id}.srt`,
+                subtitleJsonUrl,
+                subtitleJsonName: `${task.task_id}_subtitle.json`,
+                subtitleError: task.subtitle_error || "",
+              })}
+            </div>
+          `;
+
+          await mountSubtitleWidget({
+            mountId,
+            audioElementId: "previewModalAudio",
+            subtitleJsonUrl: task.subtitle_json || null,
+          });
+        } catch (err) {
+          previewModalContent.innerHTML = `<div style="color:#ff6b6b;">加载失败: ${String(err)}</div>`;
+        }
+      }
 
       async function loadUserTasks(userId) {
         const tasksList = document.getElementById("tasksList");
@@ -522,13 +849,18 @@
             tasksList.innerHTML = '<div style="text-align:center;color:var(--muted);">暂无任务</div>';
             return;
           }
-          const fullUrl = (url) => url && (url.startsWith('http') ? url : (window.location.origin + url));
           let html = '<table style="width:100%;"><thead><tr><th>任务ID</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>';
           data.tasks.forEach(task => {
             const statusColor = { 'pending': '#ffa94d', 'processing': '#74c0fc', 'completed': '#51cf66', 'failed': '#ff6b6b' }[task.status] || '#8a94a6';
             const audioLink = task.status === 'completed' && task.audio_url ? fullUrl(task.audio_url) : '';
+            const srtLink = task.status === 'completed' && task.subtitle_srt ? fullUrl(task.subtitle_srt) : '';
+            const jsonLink = task.status === 'completed' && task.subtitle_json ? fullUrl(task.subtitle_json) : '';
             let actions = '';
-            if (task.status === 'completed' && audioLink) actions = `<a href="${audioLink}" class="icon-btn" target="_blank">试听</a> <a href="${audioLink}" class="icon-btn" download>下载</a> `;
+            if (task.status === 'completed' && audioLink) {
+              actions = `<button type="button" class="icon-btn" onclick="openTaskPreview('${task.user_id}','${task.task_id}')">试听</button> <a href="${audioLink}" class="icon-btn" download>下载</a> `;
+              if (srtLink) actions += `<a href="${srtLink}" class="icon-btn" download>SRT</a> `;
+              if (jsonLink) actions += `<a href="${jsonLink}" class="icon-btn" download>JSON</a> `;
+            }
             if (task.status === 'failed' || task.status === 'completed') {
               actions += `<button type="button" class="icon-btn" onclick="deleteTaskThenRefresh('${task.user_id}','${task.task_id}','tasksModal')">删除</button> <button type="button" class="icon-btn" onclick="retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button>`;
             }
@@ -591,9 +923,15 @@
             const statusText = { 'pending': '⏳ 等待', 'processing': '🔄 处理中', 'completed': '✅ 完成', 'failed': '❌ 失败' }[task.status] || task.status;
             const text = task.params?.text || 'N/A';
             const shortText = text.length > 30 ? text.substring(0, 30) + '...' : text;
-            const audioLink = task.status === 'completed' && task.audio_url ? (task.audio_url.startsWith('http') ? task.audio_url : (window.location.origin + task.audio_url)) : '';
+            const audioLink = task.status === 'completed' && task.audio_url ? fullUrl(task.audio_url) : '';
+            const srtLink = task.status === 'completed' && task.subtitle_srt ? fullUrl(task.subtitle_srt) : '';
+            const jsonLink = task.status === 'completed' && task.subtitle_json ? fullUrl(task.subtitle_json) : '';
             let actions = '';
-            if (task.status === 'completed' && audioLink) actions = `<a href="${audioLink}" class="icon-btn" target="_blank" onclick="event.stopPropagation();">试听</a> <a href="${audioLink}" class="icon-btn" download onclick="event.stopPropagation();">下载</a> `;
+            if (task.status === 'completed' && audioLink) {
+              actions = `<button type="button" class="icon-btn" onclick="event.stopPropagation(); openTaskPreview('${task.user_id}','${task.task_id}')">试听</button> <a href="${audioLink}" class="icon-btn" download onclick="event.stopPropagation();">下载</a> `;
+              if (srtLink) actions += `<a href="${srtLink}" class="icon-btn" download onclick="event.stopPropagation();">SRT</a> `;
+              if (jsonLink) actions += `<a href="${jsonLink}" class="icon-btn" download onclick="event.stopPropagation();">JSON</a> `;
+            }
             else if (task.status === 'processing' || task.status === 'pending') actions = '<span style="color:var(--muted);font-size:11px;">处理中</span>';
             if (task.status === 'failed' || task.status === 'completed') {
               actions += `<button type="button" class="icon-btn" onclick="event.stopPropagation(); deleteTaskThenRefresh('${userId}','${task.task_id}','pageTasks')">删除</button> <button type="button" class="icon-btn" onclick="event.stopPropagation(); retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button>`;
@@ -635,14 +973,25 @@
             if (task.params.ref_text && task.params.ref_text !== '[已隐藏]') html += `<div style="margin-bottom:8px;"><div style="color:var(--muted);font-size:11px;">参考文本:</div><div style="background:#1f2635;padding:8px;border-radius:4px;margin-top:4px;font-size:12px;">${task.params.ref_text}</div></div>`;
             html += `<div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-top:8px;"><div><div style="color:var(--muted);font-size:11px;">语速:</div><div style="font-weight:600;">${task.params.speed || 1.0}</div></div><div><div style="color:var(--muted);font-size:11px;">语言:</div><div style="font-weight:600;">${task.params.lang || 'English'}</div></div><div><div style="color:var(--muted);font-size:11px;">模型:</div><div style="font-weight:600;">${task.params.model || '1.7B'}</div></div></div></div>`;
           }
+          let subtitleMountId = null;
           if (task.status === 'completed' && task.audio_url) {
-            const fullUrl = task.audio_url.startsWith('http') ? task.audio_url : (window.location.origin + task.audio_url);
-            html += `<div style="margin-top:12px; padding-top:12px; border-top:1px solid var(--border);"><div style="font-weight:600; margin-bottom:6px;">🎧 试听</div><audio controls src="${fullUrl}" style="width:100%; margin-bottom:10px;"></audio><div style="display:flex; gap:8px; flex-wrap:wrap;"><a href="${fullUrl}" download style="display:inline-block; padding:10px 20px; background:linear-gradient(135deg, var(--accent), var(--accent-2)); color:#0b0f1a; text-decoration:none; border-radius:8px; font-weight:600;">🎵 下载</a><button type="button" class="icon-btn" onclick="deleteTaskThenRefresh('${task.user_id}','${task.task_id}','pageTasks')">删除任务</button><button type="button" class="icon-btn" onclick="retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button></div><div style="margin-top:8px; font-size:11px; color:var(--muted);">采样率: ${task.sample_rate || 24000} Hz</div></div>`;
+            const audioUrl = fullUrl(task.audio_url);
+            const subtitleSrtUrl = task.subtitle_srt ? fullUrl(task.subtitle_srt) : '';
+            const subtitleJsonUrl = task.subtitle_json ? fullUrl(task.subtitle_json) : '';
+            subtitleMountId = createMountId("task-detail-subtitle");
+            html += `<div style="margin-top:12px; padding-top:12px; border-top:1px solid var(--border);"><div style="font-weight:600; margin-bottom:6px;">🎧 试听</div><audio id="${subtitleMountId}-audio" controls src="${audioUrl}" style="width:100%; margin-bottom:10px;"></audio><div style="display:flex; gap:8px; flex-wrap:wrap;"><a href="${audioUrl}" download style="display:inline-block; padding:10px 20px; background:linear-gradient(135deg, var(--accent), var(--accent-2)); color:#0b0f1a; text-decoration:none; border-radius:8px; font-weight:600;">🎵 下载</a>${subtitleSrtUrl ? `<a href="${subtitleSrtUrl}" download class="icon-btn">下载 SRT</a>` : ''}${subtitleJsonUrl ? `<a href="${subtitleJsonUrl}" download class="icon-btn">下载 JSON</a>` : ''}<button type="button" class="icon-btn" onclick="deleteTaskThenRefresh('${task.user_id}','${task.task_id}','pageTasks')">删除任务</button><button type="button" class="icon-btn" onclick="retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button></div><div style="margin-top:8px; font-size:11px; color:var(--muted);">采样率: ${task.sample_rate || 24000} Hz</div>${buildSubtitleWidgetMarkup(subtitleMountId, { subtitleSrtUrl, subtitleSrtName: `${task.task_id}.srt`, subtitleJsonUrl, subtitleJsonName: `${task.task_id}_subtitle.json`, subtitleError: task.subtitle_error || "" })}</div>`;
           }
           if (task.status === 'failed') html += `<div style="margin-top:12px; padding-top:12px; border-top:1px solid var(--border); display:flex; gap:8px;"><button type="button" class="icon-btn" onclick="deleteTaskThenRefresh('${task.user_id}','${task.task_id}','pageTasks')">删除任务</button><button type="button" class="icon-btn" onclick="retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button></div>`;
           if (task.error) html += `<div style="margin-top:12px; padding:12px; background:#3d1a1a; border-left:3px solid #ff6b6b; border-radius:4px;"><div style="color:#ff6b6b; font-weight:600; margin-bottom:4px;">错误信息</div><div style="color:#ffb3b3; font-size:12px;">${task.error}</div></div>`;
           html += '</div>';
           detailContent.innerHTML = html;
+          if (subtitleMountId) {
+            mountSubtitleWidget({
+              mountId: subtitleMountId,
+              audioElementId: `${subtitleMountId}-audio`,
+              subtitleJsonUrl: task.subtitle_json || null,
+            });
+          }
         } catch (err) {
           detailContent.innerHTML = `<div style="color:#ff6b6b;">加载失败: ${String(err)}</div>`;
         }

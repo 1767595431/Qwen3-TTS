@@ -4,10 +4,11 @@ import io
 import json
 import os
 import re
+import sys
 import time
 import threading
 from datetime import datetime
-from typing import Dict, Tuple, List, Optional
+from typing import Any, Dict, Tuple, List, Optional
 from queue import Queue
 
 import numpy as np
@@ -29,6 +30,7 @@ WEB_DIR = os.path.join(APP_DIR, "web")
 INDEX_FILE = os.path.join(WEB_DIR, "index.html")  # 全功能页面
 TASKS_DIR = os.path.join(APP_DIR, "tasks")
 AUDIO_OUTPUT_DIR = os.path.join(TASKS_DIR, "audio")
+SCRIPTS_DIR = os.path.join(APP_DIR, "scripts")
 
 # 参考音频时长限制（秒）
 REF_AUDIO_DURATION_MIN = 5.0
@@ -63,6 +65,7 @@ def _default_device_and_dtype() -> Tuple[str, torch.dtype]:
 
 
 _MODEL_CACHE: Dict[Tuple[str, str], Qwen3TTSModel] = {}
+_WHISPERX_AVAILABLE: Optional[bool] = None
 _TASKS_STORE: Dict[str, Dict] = {}  # 内存中的任务存储
 _TASKS_LOCK = threading.Lock()  # 任务存储的线程锁
 _TASK_QUEUE = Queue()  # 任务队列
@@ -114,11 +117,13 @@ def _delete_task(user_id: str, task_id: str) -> bool:
     task_data = _get_task(user_id, task_id)
     if task_data and task_data.get("audio_file"):
         audio_path = os.path.join(AUDIO_OUTPUT_DIR, task_data["audio_file"])
-        if os.path.exists(audio_path):
-            try:
-                os.remove(audio_path)
-            except OSError:
-                pass
+        srt_path, json_path = _subtitle_paths_for_audio(audio_path)
+        for path in (audio_path, srt_path, json_path):
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
     with _TASKS_LOCK:
         key = _get_task_key(user_id, task_id)
         if key in _TASKS_STORE:
@@ -258,21 +263,16 @@ def _apply_speed_ffmpeg(wav: np.ndarray, sr: int, speed: float) -> np.ndarray:
 
 
 def _apply_speed(wav, speed: float, sr: int):
-    if speed is None:
-        return wav
+    wav = np.asarray(wav, dtype=np.float32)
+    tail_pad = np.zeros(int(sr * 0.3), dtype=np.float32)
+    if speed is None or speed == 1.0:
+        return np.concatenate([wav, tail_pad])
     speed = float(speed)
     if speed < 0.1:
         speed = 0.1
-    if speed == 1.0:
-        return wav
-    wav = np.asarray(wav, dtype=np.float32)
-    # Add a short tail to avoid truncation after time-stretch.
-    tail = np.zeros(int(sr * 0.4), dtype=np.float32)
-    wav = np.concatenate([wav, tail])
-    # Use ffmpeg for speed adjustment
+    wav = np.concatenate([wav, np.zeros(int(sr * 0.4), dtype=np.float32)])
     stretched = _apply_speed_ffmpeg(wav, sr, speed)
-    # Keep a small tail to reduce missing last phoneme.
-    return np.concatenate([stretched, np.zeros(int(sr * 0.2), dtype=np.float32)])
+    return np.concatenate([stretched, tail_pad])
 
 
 def _get_audio_duration_seconds(path_or_b64: str) -> float:
@@ -312,6 +312,121 @@ def _encode_wav_base64(wav, sr: int) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _check_whisperx_available() -> bool:
+    """检测 WhisperX 是否可用（语音识别 + 字幕生成统一使用）"""
+    global _WHISPERX_AVAILABLE
+    if _WHISPERX_AVAILABLE is not None:
+        return _WHISPERX_AVAILABLE
+    try:
+        import whisperx  # noqa: F401
+        _WHISPERX_AVAILABLE = True
+        return True
+    except ImportError:
+        _WHISPERX_AVAILABLE = False
+        return False
+
+
+def _subtitle_paths_for_audio(audio_path: str) -> Tuple[str, str]:
+    """根据音频路径推导字幕文件路径。"""
+    return (
+        audio_path.replace(".wav", ".srt"),
+        audio_path.replace(".wav", "_subtitle.json"),
+    )
+
+
+def _generate_subtitles_for_audio(audio_path: str, language: str, original_text: str = "") -> Optional[Dict]:
+    """调用 WhisperX 为生成的音频生成字幕数据。"""
+    if not _check_whisperx_available():
+        return None
+    try:
+        orig_path = list(sys.path)
+        sys.path.insert(0, SCRIPTS_DIR)
+        try:
+            from subtitle import generate_subtitle_inline  # pyright: ignore[reportMissingImports]
+            return generate_subtitle_inline(audio_path, language, original_text=original_text)
+        finally:
+            sys.path[:] = orig_path
+    except Exception as e:
+        print(f"[字幕] 生成失败: {e}")
+        return None
+
+
+def _write_subtitle_files(subtitle_data: Dict, audio_path: str) -> Tuple[Optional[str], Optional[str]]:
+    """将字幕数据写入 SRT 和 JSON 文件。"""
+    srt_path = None
+    json_path = None
+    try:
+        orig_path = list(sys.path)
+        sys.path.insert(0, SCRIPTS_DIR)
+        try:
+            from subtitle import write_srt, write_subtitle_json  # pyright: ignore[reportMissingImports]
+            srt_out, json_out = _subtitle_paths_for_audio(audio_path)
+            write_srt(subtitle_data["segments"], srt_out, granularity="sentence")
+            write_subtitle_json(subtitle_data, json_out)
+            srt_path = srt_out
+            json_path = json_out
+        finally:
+            sys.path[:] = orig_path
+    except Exception as e:
+        print(f"[字幕] 写入文件失败: {e}")
+    return srt_path, json_path
+
+
+def _build_inline_subtitle_payload(audio_path: str, language: str, original_text: str = "") -> Dict[str, Any]:
+    """为同步接口构造内联字幕内容。"""
+    payload: Dict[str, Any] = {"subtitle_generated": False}
+    if not _check_whisperx_available():
+        payload["subtitle_error"] = "WhisperX 未安装，无法为合成结果生成字幕"
+        return payload
+
+    try:
+        orig_path = list(sys.path)
+        sys.path.insert(0, SCRIPTS_DIR)
+        try:
+            from subtitle import (  # pyright: ignore[reportMissingImports]
+                build_srt_content,
+                build_subtitle_json_payload,
+                generate_subtitle_inline,
+            )
+            subtitle_data = generate_subtitle_inline(audio_path, language, original_text=original_text)
+        finally:
+            sys.path[:] = orig_path
+
+        payload["subtitle_generated"] = True
+        payload["subtitle_language"] = subtitle_data.get("language", "")
+        payload["subtitle_srt"] = build_srt_content(
+            subtitle_data.get("segments", []),
+            granularity="sentence",
+        )
+        payload["subtitle_json"] = build_subtitle_json_payload(subtitle_data)
+    except Exception as e:
+        payload["subtitle_error"] = str(e)
+
+    return payload
+
+
+def _check_local_whisperx_cache() -> Dict[str, Any]:
+    """检查本地 WhisperX 模型缓存状态。"""
+    orig_path = list(sys.path)
+    sys.path.insert(0, SCRIPTS_DIR)
+    try:
+        from subtitle import get_whisperx_cache_status  # pyright: ignore[reportMissingImports]
+        return get_whisperx_cache_status()
+    finally:
+        sys.path[:] = orig_path
+
+
+def _preload_subtitle_models() -> Dict[str, Any]:
+    """预加载 WhisperX 字幕模型。"""
+    orig_path = list(sys.path)
+    sys.path.insert(0, SCRIPTS_DIR)
+    try:
+        from subtitle import preload_whisperx_assets  # pyright: ignore[reportMissingImports]
+        return preload_whisperx_assets()
+    finally:
+        sys.path[:] = orig_path
+
+
 def _strip_inline_pinyin(text: str) -> str:
     """Strip inline pinyin annotations like 汉[pin1] / 汉(pin1) / 汉{pin1} to avoid reading pinyin."""
     # Remove inline pinyin markers to prevent model from reading the pinyin letters
@@ -319,14 +434,19 @@ def _strip_inline_pinyin(text: str) -> str:
     return text
 
 
+def _normalize_text_for_tts(text: str) -> str:
+    """Collapse newlines and excess whitespace so the model sees a single paragraph."""
+    text = re.sub(r'\r\n|\r|\n', ' ', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    return text.strip()
+
+
 def _apply_polyphonic(text: str) -> str:
-    """Remove any inline pinyin annotations from text."""
+    """Clean up text before synthesis: normalise whitespace + strip pinyin annotations."""
     if not text:
         return text
-    
-    # Simply strip any pinyin annotations to prevent model from reading them
+    text = _normalize_text_for_tts(text)
     text = _strip_inline_pinyin(text)
-    
     return text
 
 
@@ -381,6 +501,37 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+def startup_preload_models():
+    """启动时检查并预加载 WhisperX 字幕模型。"""
+    print("\n" + "=" * 60)
+    print("正在启动 Qwen3-TTS 全功能服务...")
+    print("=" * 60)
+
+    if _check_whisperx_available():
+        try:
+            cache_status = _check_local_whisperx_cache()
+            model_dir = cache_status.get("model_dir", "")
+            if cache_status.get("has_cache"):
+                print("[1/1] 检测到本地 WhisperX 缓存，开始预加载字幕模型...")
+            else:
+                print("[1/1] 未检测到本地 WhisperX 模型缓存，开始自动下载并预加载...")
+                print(f"      下载目录: {model_dir}")
+
+            preload_info = _preload_subtitle_models()
+            align_lang = preload_info.get("align_language")
+            align_note = f", 对齐语言: {align_lang}" if align_lang else ""
+            print(
+                f"[OK] WhisperX 字幕模型加载成功 "
+                f"(模型: {preload_info.get('model_name')}, 目录: {model_dir}{align_note})"
+            )
+        except Exception as e:
+            print(f"[FAIL] WhisperX 字幕模型预加载失败: {e}")
+    else:
+        print("[1/1] WhisperX 未安装，跳过字幕模型预加载")
+        print("      安装后模型缓存目录: models/WhisperX")
+
+
 @app.get("/")
 def index():
     return FileResponse(INDEX_FILE)
@@ -408,7 +559,22 @@ def custom_voice(req: CustomVoiceRequest):
             sr,
         )
         audio_b64 = _encode_wav_base64(wav_out, sr)
-        return {"sample_rate": sr, "audio_b64": audio_b64}
+        response: Dict[str, Any] = {"sample_rate": sr, "audio_b64": audio_b64}
+
+        temp_audio_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
+                temp_audio_path = tmp_audio.name
+            sf.write(temp_audio_path, wav_out, sr, format="WAV")
+            response.update(_build_inline_subtitle_payload(temp_audio_path, req.language, original_text=req.text))
+        finally:
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                try:
+                    os.remove(temp_audio_path)
+                except OSError:
+                    pass
+
+        return response
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -429,7 +595,22 @@ def voice_design(req: VoiceDesignRequest):
             sr,
         )
         audio_b64 = _encode_wav_base64(wav_out, sr)
-        return {"sample_rate": sr, "audio_b64": audio_b64}
+        response: Dict[str, Any] = {"sample_rate": sr, "audio_b64": audio_b64}
+
+        temp_audio_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
+                temp_audio_path = tmp_audio.name
+            sf.write(temp_audio_path, wav_out, sr, format="WAV")
+            response.update(_build_inline_subtitle_payload(temp_audio_path, req.language, original_text=req.text))
+        finally:
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                try:
+                    os.remove(temp_audio_path)
+                except OSError:
+                    pass
+
+        return response
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -459,7 +640,22 @@ def voice_clone(req: VoiceCloneRequest):
             sr,
         )
         audio_b64 = _encode_wav_base64(wav_out, sr)
-        return {"sample_rate": sr, "audio_b64": audio_b64}
+        response: Dict[str, Any] = {"sample_rate": sr, "audio_b64": audio_b64}
+
+        temp_audio_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
+                temp_audio_path = tmp_audio.name
+            sf.write(temp_audio_path, wav_out, sr, format="WAV")
+            response.update(_build_inline_subtitle_payload(temp_audio_path, req.language, original_text=req.text))
+        finally:
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                try:
+                    os.remove(temp_audio_path)
+                except OSError:
+                    pass
+
+        return response
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -499,6 +695,24 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         audio_filename = f"{user_id}_{task_id}.wav"
         audio_path = os.path.join(AUDIO_OUTPUT_DIR, audio_filename)
         sf.write(audio_path, wav_out, sr, format="WAV")
+
+        # 生成字幕（可选，失败不影响主任务）
+        subtitle_srt_url = None
+        subtitle_json_url = None
+        subtitle_error = None
+        try:
+            if not _check_whisperx_available():
+                subtitle_error = "WhisperX 未安装，无法为合成结果生成字幕"
+            subtitle_data = _generate_subtitles_for_audio(audio_path, params["lang"], original_text=params.get("text", ""))
+            if subtitle_data:
+                srt_path, json_path = _write_subtitle_files(subtitle_data, audio_path)
+                if srt_path:
+                    subtitle_srt_url = f"/api/download/{user_id}/{task_id}?type=srt"
+                if json_path:
+                    subtitle_json_url = f"/api/download/{user_id}/{task_id}?type=json"
+        except Exception as e:
+            subtitle_error = str(e)
+            print(f"[字幕] 生成跳过: {e}")
         
         # 更新任务状态为完成
         task_data["status"] = "completed"
@@ -506,6 +720,12 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         task_data["audio_url"] = f"/api/download/{user_id}/{task_id}"
         task_data["audio_file"] = audio_filename
         task_data["sample_rate"] = int(sr)
+        if subtitle_srt_url:
+            task_data["subtitle_srt"] = subtitle_srt_url
+        if subtitle_json_url:
+            task_data["subtitle_json"] = subtitle_json_url
+        if subtitle_error:
+            task_data["subtitle_error"] = subtitle_error
         _save_task(user_id, task_id, task_data)
         
         print(f"[Task {task_id}] 任务完成，音频已保存到: {audio_path}")
@@ -633,6 +853,10 @@ def get_user_tasks(user_id: str, request: Request):
                 t["params"]["ref_audio_b64"] = "[已隐藏]"
             if t.get("audio_url") and not t["audio_url"].startswith("http"):
                 t["audio_url"] = base + t["audio_url"]
+            if t.get("subtitle_srt") and not t["subtitle_srt"].startswith("http"):
+                t["subtitle_srt"] = base + t["subtitle_srt"]
+            if t.get("subtitle_json") and not t["subtitle_json"].startswith("http"):
+                t["subtitle_json"] = base + t["subtitle_json"]
             out_tasks.append(t)
         
         return {
@@ -659,8 +883,13 @@ def get_task_status(user_id: str, task_id: str, request: Request):
         out = copy.deepcopy(task)
         if "params" in out and "ref_audio_b64" in out["params"]:
             out["params"]["ref_audio_b64"] = "[已隐藏]"
+        base_url = _base_url(request)
         if out.get("audio_url") and not out["audio_url"].startswith("http"):
-            out["audio_url"] = _base_url(request) + out["audio_url"]
+            out["audio_url"] = base_url + out["audio_url"]
+        if out.get("subtitle_srt") and not out["subtitle_srt"].startswith("http"):
+            out["subtitle_srt"] = base_url + out["subtitle_srt"]
+        if out.get("subtitle_json") and not out["subtitle_json"].startswith("http"):
+            out["subtitle_json"] = base_url + out["subtitle_json"]
         
         return out
     except HTTPException:
@@ -726,7 +955,7 @@ def retry_task(user_id: str, task_id: str):
 
 
 @app.get("/api/download/{user_id}/{task_id}")
-def download_audio(user_id: str, task_id: str):
+def download_audio(user_id: str, task_id: str, type: str = Query("audio", regex="^(audio|srt|json)$")):
     """
     下载任务生成的音频文件
     
@@ -734,7 +963,7 @@ def download_audio(user_id: str, task_id: str):
     - user_id: 用户标识
     - task_id: 任务ID
     
-    返回：音频文件
+    返回：音频文件或字幕文件
     """
     try:
         task = _get_task(user_id, task_id)
@@ -749,6 +978,26 @@ def download_audio(user_id: str, task_id: str):
             raise HTTPException(status_code=404, detail="音频文件不存在")
         
         audio_path = os.path.join(AUDIO_OUTPUT_DIR, audio_filename)
+        srt_path, json_path = _subtitle_paths_for_audio(audio_path)
+
+        if type == "srt":
+            if not os.path.exists(srt_path):
+                raise HTTPException(status_code=404, detail="SRT 字幕文件不存在（WhisperX 可能未安装或生成失败）")
+            return FileResponse(
+                path=srt_path,
+                media_type="text/plain; charset=utf-8",
+                filename=f"{task_id}.srt"
+            )
+
+        if type == "json":
+            if not os.path.exists(json_path):
+                raise HTTPException(status_code=404, detail="JSON 字幕文件不存在（WhisperX 可能未安装或生成失败）")
+            return FileResponse(
+                path=json_path,
+                media_type="application/json; charset=utf-8",
+                filename=f"{task_id}_subtitle.json"
+            )
+
         if not os.path.exists(audio_path):
             raise HTTPException(status_code=404, detail="音频文件未找到")
         

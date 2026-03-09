@@ -496,7 +496,7 @@
         clearTaskCheck();
 
         const payload = {
-          text: document.getElementById("text").value.trim(),
+          text: document.getElementById("text").value.replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ').trim(),
           language: document.getElementById("language").value || "Auto",
           model_size: modelSize.value,
           speed: speedEnabled.checked ? Number(speed.value) : 1.0,

@@ -1,6 +1,6 @@
 """
 语音克隆专用服务（仅提供 Base 模型异步任务接口）
-支持 SenseVoice 语音识别：上传参考音频自动识别文本
+支持 WhisperX 语音识别与字幕生成
 启动: python api_base.py
 """
 import base64
@@ -12,9 +12,19 @@ import re
 import sys
 import time
 import threading
+import warnings
 from datetime import datetime
 from typing import Dict, Tuple, List, Optional, Any
 from queue import Queue
+
+warnings.filterwarnings("ignore", message="torchcodec is not installed")
+warnings.filterwarnings("ignore", message="Passing `gradient_checkpointing` to a config")
+
+import logging
+logging.getLogger("whisperx").setLevel(logging.WARNING)
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+logging.getLogger("lightning").setLevel(logging.ERROR)
+logging.getLogger("lightning.pytorch.utilities.migration.utils").setLevel(logging.ERROR)
 
 import numpy as np
 import soundfile as sf
@@ -34,12 +44,8 @@ WEB_DIR = os.path.join(APP_DIR, "web")
 INDEX_FILE = os.path.join(WEB_DIR, "index_base.html")
 TASKS_DIR = os.path.join(APP_DIR, "tasks")
 AUDIO_OUTPUT_DIR = os.path.join(TASKS_DIR, "audio")
-SENSEVOICE_DIR = os.path.join(APP_DIR, "SenseVoiceSmall")
 SCRIPTS_DIR = os.path.join(APP_DIR, "scripts")
 GTCRN_MODEL_PATH = os.path.join(SCRIPTS_DIR, "model_trained_on_dns3.tar")
-
-# 语音识别相关模型（SenseVoice、VAD 等）统一缓存到 SenseVoiceSmall 目录
-os.environ["MODELSCOPE_CACHE"] = os.path.join(SENSEVOICE_DIR, "cache")
 
 # 参考音频时长限制（秒）
 REF_AUDIO_DURATION_MIN = 3.0  # 官方支持3秒快速克隆
@@ -68,9 +74,8 @@ def _default_device_and_dtype() -> Tuple[str, torch.dtype]:
 
 
 _MODEL_CACHE: Dict[str, Qwen3TTSModel] = {}
-_ASR_MODEL: Any = None  # SenseVoice 语音识别模型
-_ASR_AVAILABLE: Optional[bool] = None  # None=未检测, True=可用, False=不可用
 _ENHANCER_AVAILABLE: Optional[bool] = None  # GTCRN 降噪是否可用
+_WHISPERX_AVAILABLE: Optional[bool] = None  # WhisperX 是否可用（语音识别 + 字幕生成）
 _TASKS_STORE: Dict[str, Dict] = {}  # 内存中的任务存储
 _TASKS_LOCK = threading.Lock()  # 任务存储的线程锁
 _TASK_QUEUE = Queue()  # 任务队列
@@ -124,11 +129,13 @@ def _delete_task(user_id: str, task_id: str) -> bool:
     task_data = _get_task(user_id, task_id)
     if task_data and task_data.get("audio_file"):
         audio_path = os.path.join(AUDIO_OUTPUT_DIR, task_data["audio_file"])
-        if os.path.exists(audio_path):
-            try:
-                os.remove(audio_path)
-            except OSError:
-                pass
+        srt_path, json_path = _subtitle_paths_for_audio(audio_path)
+        for path in (audio_path, srt_path, json_path):
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
     with _TASKS_LOCK:
         key = _get_task_key(user_id, task_id)
         if key in _TASKS_STORE:
@@ -263,70 +270,139 @@ def _enhance_audio_for_asr(input_path: str) -> str:
         sys.path[:] = orig_path
 
 
-def _check_asr_available() -> bool:
-    """检测 SenseVoice 语音识别是否可用"""
-    global _ASR_AVAILABLE
-    if _ASR_AVAILABLE is not None:
-        return _ASR_AVAILABLE
+def _check_whisperx_available() -> bool:
+    """检测 WhisperX 是否可用（语音识别 + 字幕生成统一使用）"""
+    global _WHISPERX_AVAILABLE
+    if _WHISPERX_AVAILABLE is not None:
+        return _WHISPERX_AVAILABLE
     try:
-        import funasr  # noqa: F401
-        _ASR_AVAILABLE = True
+        import whisperx  # noqa: F401
+        _WHISPERX_AVAILABLE = True
         return True
     except ImportError:
-        _ASR_AVAILABLE = False
+        _WHISPERX_AVAILABLE = False
         return False
 
 
-def _get_asr_model():
-    """
-    延迟加载 SenseVoice 语音识别模型
-    使用模型名称 "iic/SenseVoiceSmall"，下载到 SenseVoiceSmall/cache 目录
-    """
-    global _ASR_MODEL
-    if _ASR_MODEL is not None:
-        return _ASR_MODEL
-    
+def _recognize_audio(audio_path: str, language: str = "Auto") -> str:
+    """使用 WhisperX 识别音频文本，返回纯文本"""
+    orig_path = list(sys.path)
+    sys.path.insert(0, SCRIPTS_DIR)
     try:
-        from funasr import AutoModel
-        
-        model_dir = "iic/SenseVoiceSmall"
-        
-        # 按照官方文档示例，模型会下载到 MODELSCOPE_CACHE 指定的目录
-        _ASR_MODEL = AutoModel(
-            model=model_dir,
-            trust_remote_code=True,
-            remote_code="./model.py",
-            vad_model="fsmn-vad",
-            vad_kwargs={"max_single_segment_time": 30000},
-            device="cuda:0" if torch.cuda.is_available() else "cpu",
-            disable_update=True,  # 禁用版本检查
-        )
-        return _ASR_MODEL
+        from subtitle import recognize_text  # pyright: ignore[reportMissingImports]
+        return recognize_text(audio_path, language)
+    finally:
+        sys.path[:] = orig_path
+
+
+def _generate_subtitles_for_audio(audio_path: str, language: str, original_text: str = "") -> Optional[Dict]:
+    """
+    调用 WhisperX 为生成的音频生成字幕数据。
+    如果提供了 original_text，字幕文本使用原文（WhisperX 仅提供时间戳）。
+    失败时返回 None（不影响 TTS 主流程）。
+    """
+    if not _check_whisperx_available():
+        return None
+    try:
+        orig_path = list(sys.path)
+        sys.path.insert(0, SCRIPTS_DIR)
+        try:
+            from subtitle import generate_subtitle_inline  # pyright: ignore[reportMissingImports]
+            return generate_subtitle_inline(audio_path, language, original_text=original_text)
+        finally:
+            sys.path[:] = orig_path
     except Exception as e:
-        raise RuntimeError(f"SenseVoice 模型加载失败: {e}")
+        print(f"[字幕] 生成失败: {e}")
+        return None
 
 
-def _recognize_audio(audio_path: str) -> str:
+def _write_subtitle_files(subtitle_data: Dict, audio_path: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    使用 SenseVoice 识别音频文本（完全按照官方 README.md 第 114-124 行）
+    将字幕数据写入 SRT 和 JSON 文件。
+    返回 (srt_path, json_path)，失败则对应项为 None。
     """
-    from funasr.utils.postprocess_utils import rich_transcription_postprocess
-    
-    model = _get_asr_model()
-    
-    # 完全按照官方文档示例
-    res = model.generate(
-        input=audio_path,
-        cache={},
-        language="auto",  # "zn", "en", "yue", "ja", "ko", "nospeech"
-        use_itn=True,
-        batch_size_s=60,
-        merge_vad=True,
-        merge_length_s=15,
+    srt_path = None
+    json_path = None
+    try:
+        orig_path = list(sys.path)
+        sys.path.insert(0, SCRIPTS_DIR)
+        try:
+            from subtitle import write_srt, write_subtitle_json  # pyright: ignore[reportMissingImports]
+            srt_out = audio_path.replace(".wav", ".srt")
+            write_srt(subtitle_data["segments"], srt_out, granularity="sentence")
+            srt_path = srt_out
+
+            json_out = audio_path.replace(".wav", "_subtitle.json")
+            write_subtitle_json(subtitle_data, json_out)
+            json_path = json_out
+        finally:
+            sys.path[:] = orig_path
+    except Exception as e:
+        print(f"[字幕] 写入文件失败: {e}")
+    return srt_path, json_path
+
+
+def _subtitle_paths_for_audio(audio_path: str) -> Tuple[str, str]:
+    """根据音频路径推导字幕文件路径。"""
+    return (
+        audio_path.replace(".wav", ".srt"),
+        audio_path.replace(".wav", "_subtitle.json"),
     )
-    
-    text = rich_transcription_postprocess(res[0]["text"])
-    return text
+
+
+def _build_inline_subtitle_payload(audio_path: str, language: str, original_text: str = "") -> Dict[str, Any]:
+    """为同步接口构造内联字幕内容。"""
+    payload: Dict[str, Any] = {"subtitle_generated": False}
+    if not _check_whisperx_available():
+        payload["subtitle_error"] = "WhisperX 未安装，无法为合成结果生成字幕"
+        return payload
+
+    try:
+        orig_path = list(sys.path)
+        sys.path.insert(0, SCRIPTS_DIR)
+        try:
+            from subtitle import (  # pyright: ignore[reportMissingImports]
+                build_srt_content,
+                build_subtitle_json_payload,
+                generate_subtitle_inline,
+            )
+            subtitle_data = generate_subtitle_inline(audio_path, language, original_text=original_text)
+        finally:
+            sys.path[:] = orig_path
+
+        payload["subtitle_generated"] = True
+        payload["subtitle_language"] = subtitle_data.get("language", "")
+        payload["subtitle_srt"] = build_srt_content(
+            subtitle_data.get("segments", []),
+            granularity="sentence",
+        )
+        payload["subtitle_json"] = build_subtitle_json_payload(subtitle_data)
+    except Exception as e:
+        payload["subtitle_error"] = str(e)
+
+    return payload
+
+
+def _check_local_whisperx_cache() -> Dict[str, Any]:
+    """检查本地 WhisperX 模型缓存状态。"""
+    orig_path = list(sys.path)
+    sys.path.insert(0, SCRIPTS_DIR)
+    try:
+        from subtitle import get_whisperx_cache_status  # pyright: ignore[reportMissingImports]
+        return get_whisperx_cache_status()
+    finally:
+        sys.path[:] = orig_path
+
+
+def _preload_subtitle_models() -> Dict[str, Any]:
+    """预加载 WhisperX 字幕模型。"""
+    orig_path = list(sys.path)
+    sys.path.insert(0, SCRIPTS_DIR)
+    try:
+        from subtitle import preload_whisperx_assets  # pyright: ignore[reportMissingImports]
+        return preload_whisperx_assets()
+    finally:
+        sys.path[:] = orig_path
 
 
 def _build_atempo_filter(speed: float) -> str:
@@ -372,21 +448,16 @@ def _apply_speed_ffmpeg(wav: np.ndarray, sr: int, speed: float) -> np.ndarray:
 
 
 def _apply_speed(wav, speed: float, sr: int):
-    if speed is None:
-        return wav
+    wav = np.asarray(wav, dtype=np.float32)
+    tail_pad = np.zeros(int(sr * 0.3), dtype=np.float32)
+    if speed is None or speed == 1.0:
+        return np.concatenate([wav, tail_pad])
     speed = float(speed)
     if speed < 0.1:
         speed = 0.1
-    if speed == 1.0:
-        return wav
-    wav = np.asarray(wav, dtype=np.float32)
-    # Add a short tail to avoid truncation after time-stretch.
-    tail = np.zeros(int(sr * 0.4), dtype=np.float32)
-    wav = np.concatenate([wav, tail])
-    # Use ffmpeg for speed adjustment
+    wav = np.concatenate([wav, np.zeros(int(sr * 0.4), dtype=np.float32)])
     stretched = _apply_speed_ffmpeg(wav, sr, speed)
-    # Keep a small tail to reduce missing last phoneme.
-    return np.concatenate([stretched, np.zeros(int(sr * 0.2), dtype=np.float32)])
+    return np.concatenate([stretched, tail_pad])
 
 
 def _get_audio_duration_seconds(path_or_b64: str) -> float:
@@ -438,14 +509,19 @@ def _strip_inline_pinyin(text: str) -> str:
     return text
 
 
+def _normalize_text_for_tts(text: str) -> str:
+    """Collapse newlines and excess whitespace so the model sees a single paragraph."""
+    text = re.sub(r'\r\n|\r|\n', ' ', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    return text.strip()
+
+
 def _apply_polyphonic(text: str) -> str:
-    """Remove any inline pinyin annotations from text."""
+    """Clean up text before synthesis: normalise whitespace + strip pinyin annotations."""
     if not text:
         return text
-    
-    # Simply strip any pinyin annotations to prevent model from reading them
+    text = _normalize_text_for_tts(text)
     text = _strip_inline_pinyin(text)
-    
     return text
 
 
@@ -477,18 +553,30 @@ def startup_preload_models():
     print("正在启动 Qwen3-TTS 语音克隆服务...")
     print("="*60)
     
-    # 1. 预加载 SenseVoice 语音识别模型
-    if _check_asr_available():
+    # 1. 预加载 WhisperX 模型（语音识别 + 字幕生成统一使用）
+    if _check_whisperx_available():
         try:
-            print("[1/2] 加载 SenseVoice 语音识别模型...")
-            _get_asr_model()
-            print("[OK] SenseVoice 模型加载成功")
+            cache_status = _check_local_whisperx_cache()
+            model_dir = cache_status.get("model_dir", "")
+            if cache_status.get("has_cache"):
+                print("[1/2] 检测到本地 WhisperX 缓存，开始预加载模型...")
+            else:
+                print("[1/2] 未检测到本地 WhisperX 模型缓存，开始自动下载并预加载...")
+                print(f"      下载目录: {model_dir}")
+
+            preload_info = _preload_subtitle_models()
+            align_lang = preload_info.get("align_language")
+            align_note = f", 对齐语言: {align_lang}" if align_lang else ""
+            print(
+                f"[OK] WhisperX 模型加载成功 "
+                f"(模型: {preload_info.get('model_name')}, 目录: {model_dir}{align_note})"
+            )
         except Exception as e:
-            print(f"[FAIL] SenseVoice 模型加载失败: {e}")
+            print(f"[FAIL] WhisperX 模型预加载失败: {e}")
     else:
-        print("[1/2] SenseVoice 未安装，跳过预加载")
-        print("      安装命令: pip install -U funasr modelscope")
-    
+        print("[1/2] WhisperX 未安装，语音识别和字幕生成均不可用")
+        print("      安装命令: pip install whisperx")
+
     # 2. 预加载 GTCRN 降噪模型
     if _check_enhancer_available():
         try:
@@ -506,7 +594,7 @@ def startup_preload_models():
             print(f"[FAIL] GTCRN 降噪模型加载失败: {e}")
     else:
         print("[2/2] GTCRN 降噪模型不可用，跳过预加载")
-    
+
     # 3. 启动任务队列工作线程
     _start_queue_worker()
     
@@ -526,11 +614,11 @@ def health():
 @app.get("/api/asr/status")
 def asr_status():
     """
-    检查 SenseVoice 语音识别和 GTCRN 降噪是否可用
+    检查 WhisperX 语音识别和 GTCRN 降噪是否可用
     返回: { "available": true/false, "enhancer": true/false, "duration_min": 3, "duration_max": 15 }
     """
     return {
-        "available": _check_asr_available(),
+        "available": _check_whisperx_available(),
         "enhancer": _check_enhancer_available(),
         "duration_min": int(REF_AUDIO_DURATION_MIN),
         "duration_max": int(REF_AUDIO_DURATION_MAX),
@@ -540,63 +628,57 @@ def asr_status():
 @app.post("/api/asr")
 async def recognize_audio(file: UploadFile = File(...)):
     """
-    使用 SenseVoice 识别参考音频文本
-    流程：上传音频 → GTCRN降噪增强(16kHz wav) → SenseVoice识别
+    使用 WhisperX 识别参考音频文本
+    流程：上传音频 → GTCRN降噪增强(可选) → WhisperX 识别
     """
-    if not _check_asr_available():
+    if not _check_whisperx_available():
         raise HTTPException(
             status_code=503,
-            detail="SenseVoice 未就绪。请安装: pip install -U funasr modelscope"
+            detail="WhisperX 未就绪。请安装: pip install whisperx"
         )
     if not file.filename or not file.content_type:
         raise HTTPException(status_code=400, detail="请上传有效的音频文件")
     allowed = {"audio/", "application/octet-stream"}
     if not any(file.content_type.startswith(t) for t in allowed):
-        # 仍尝试处理，因部分浏览器可能错误上报 content-type
         pass
     
     tmp_path = None
     enhanced_path = None
     try:
-        # 保存上传文件
         suffix = os.path.splitext(file.filename or "")[-1] or ".wav"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
         
-        # 验证音频时长（3-15 秒）
         try:
             duration = _get_audio_duration_seconds(tmp_path)
             _validate_ref_audio_duration(duration)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         
-        # 步骤1：GTCRN 降噪增强，输出 16kHz wav
         if _check_enhancer_available():
             try:
-                print(f"[识别] 降噪增强 → 识别文本 ({duration:.1f}s)")
+                print(f"[识别] 降噪增强 → WhisperX 识别 ({duration:.1f}s)")
                 enhanced_path = _enhance_audio_for_asr(tmp_path)
                 asr_input = enhanced_path
             except Exception as e:
                 print(f"[识别] 降噪失败，直接识别: {e}")
                 asr_input = tmp_path
         else:
-            print(f"[识别] 直接识别 ({duration:.1f}s)")
+            print(f"[识别] WhisperX 直接识别 ({duration:.1f}s)")
             asr_input = tmp_path
         
-        # 步骤2：SenseVoice 识别
         text = _recognize_audio(asr_input)
         print(f"[OK] 识别完成: {text[:50]}{'...' if len(text) > 50 else ''}")
         
         return {"text": text.strip() if text else ""}
         
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"识别失败: {str(e)}")
     finally:
-        # 清理临时文件
         if tmp_path:
             try:
                 os.remove(tmp_path)
@@ -658,12 +740,38 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         
         sf.write(audio_path, wav_out, sr, format="WAV")
         
+        # 生成字幕（可选，失败不影响主任务）
+        subtitle_srt_url = None
+        subtitle_json_url = None
+        subtitle_error = None
+        try:
+            if not _check_whisperx_available():
+                subtitle_error = "WhisperX 未安装，无法为合成结果生成字幕"
+            subtitle_data = _generate_subtitles_for_audio(audio_path, params["lang"], original_text=params.get("text", ""))
+            if subtitle_data:
+                srt_path, json_path = _write_subtitle_files(subtitle_data, audio_path)
+                if srt_path:
+                    subtitle_srt_url = f"/api/download/{user_id}/{task_id}?type=srt"
+                    print(f"[字幕] SRT 已生成: {os.path.basename(srt_path)}")
+                if json_path:
+                    subtitle_json_url = f"/api/download/{user_id}/{task_id}?type=json"
+                    print(f"[字幕] JSON 已生成: {os.path.basename(json_path)}")
+        except Exception as e:
+            subtitle_error = str(e)
+            print(f"[字幕] 生成跳过: {e}")
+        
         # 更新任务状态为完成
         task_data["status"] = "completed"
         task_data["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         task_data["audio_url"] = f"/api/download/{user_id}/{task_id}"
         task_data["audio_file"] = audio_filename
         task_data["sample_rate"] = int(sr)
+        if subtitle_srt_url:
+            task_data["subtitle_srt"] = subtitle_srt_url
+        if subtitle_json_url:
+            task_data["subtitle_json"] = subtitle_json_url
+        if subtitle_error:
+            task_data["subtitle_error"] = subtitle_error
         _save_task(user_id, task_id, task_data)
         
         print(f"[OK] 任务 {task_id} 完成 (时长: {len(wav_out)/sr:.1f}s)")
@@ -727,7 +835,22 @@ def voice_clone_sync(req: VoiceCloneRequest):
         
         # 编码为 base64 返回
         audio_b64 = _encode_wav_base64(wav_out, sr)
-        return {"sample_rate": sr, "audio_b64": audio_b64}
+        response: Dict[str, Any] = {"sample_rate": sr, "audio_b64": audio_b64}
+
+        temp_audio_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
+                temp_audio_path = tmp_audio.name
+            sf.write(temp_audio_path, wav_out, sr, format="WAV")
+            response.update(_build_inline_subtitle_payload(temp_audio_path, req.language, original_text=req.text))
+        finally:
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                try:
+                    os.remove(temp_audio_path)
+                except OSError:
+                    pass
+
+        return response
         
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -857,8 +980,13 @@ def get_task_status(user_id: str, task_id: str, request: Request):
         out = copy.deepcopy(task)
         if "params" in out and "ref_audio_b64" in out["params"]:
             out["params"]["ref_audio_b64"] = "[已隐藏]"
+        base_url = _base_url(request)
         if out.get("audio_url") and not out["audio_url"].startswith("http"):
-            out["audio_url"] = _base_url(request) + out["audio_url"]
+            out["audio_url"] = base_url + out["audio_url"]
+        if out.get("subtitle_srt") and not out["subtitle_srt"].startswith("http"):
+            out["subtitle_srt"] = base_url + out["subtitle_srt"]
+        if out.get("subtitle_json") and not out["subtitle_json"].startswith("http"):
+            out["subtitle_json"] = base_url + out["subtitle_json"]
         
         # 添加禁用缓存的响应头，确保每次获取最新状态
         return JSONResponse(
@@ -892,6 +1020,10 @@ def list_user_tasks(user_id: str, request: Request):
                 task["params"]["ref_audio_b64"] = "[已隐藏]"
             if task.get("audio_url") and not task["audio_url"].startswith("http"):
                 task["audio_url"] = base_url + task["audio_url"]
+            if task.get("subtitle_srt") and not task["subtitle_srt"].startswith("http"):
+                task["subtitle_srt"] = base_url + task["subtitle_srt"]
+            if task.get("subtitle_json") and not task["subtitle_json"].startswith("http"):
+                task["subtitle_json"] = base_url + task["subtitle_json"]
         
         return {
             "user_id": user_id,
@@ -917,8 +1049,13 @@ def delete_task(user_id: str, task_id: str):
 
 
 @app.get("/api/download/{user_id}/{task_id}")
-def download_audio(user_id: str, task_id: str):
-    """下载任务生成的音频文件"""
+def download_file(user_id: str, task_id: str, type: str = Query("audio", regex="^(audio|srt|json)$")):
+    """
+    下载任务生成的文件
+
+    参数:
+    - type: 文件类型，audio（默认）/ srt / json
+    """
     task = _get_task(user_id, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -934,13 +1071,33 @@ def download_audio(user_id: str, task_id: str):
         raise HTTPException(status_code=404, detail="音频文件不存在")
     
     audio_path = os.path.join(AUDIO_OUTPUT_DIR, audio_file)
+    srt_path, json_path = _subtitle_paths_for_audio(audio_path)
+
+    if type == "srt":
+        if not os.path.exists(srt_path):
+            raise HTTPException(status_code=404, detail="SRT 字幕文件不存在（WhisperX 可能未安装或生成失败）")
+        return FileResponse(
+            srt_path,
+            media_type="text/plain; charset=utf-8",
+            filename=f"{task_id}.srt",
+        )
+    
+    if type == "json":
+        if not os.path.exists(json_path):
+            raise HTTPException(status_code=404, detail="JSON 字幕文件不存在（WhisperX 可能未安装或生成失败）")
+        return FileResponse(
+            json_path,
+            media_type="application/json; charset=utf-8",
+            filename=f"{task_id}_subtitle.json",
+        )
+    
     if not os.path.exists(audio_path):
         raise HTTPException(status_code=404, detail="音频文件已被删除")
     
     return FileResponse(
         audio_path,
         media_type="audio/wav",
-        filename=f"{task_id}.wav"
+        filename=f"{task_id}.wav",
     )
 
 
@@ -951,7 +1108,7 @@ if __name__ == "__main__":
     # 解析命令行参数
     parser = argparse.ArgumentParser(description="Qwen3-TTS 语音克隆服务")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址（默认: 0.0.0.0）")
-    parser.add_argument("--port", type=int, default=9770, help="监听端口（默认: 9770）")
+    parser.add_argument("--port", type=int, default=9778, help="监听端口（默认: 9770）")
     args = parser.parse_args()
     
     HOST = args.host
@@ -960,7 +1117,7 @@ if __name__ == "__main__":
     # 启动前打印服务信息
     print("="*60)
     print("[OK] 服务启动完成！")
-    print(f"[INFO] 缓存目录: {SENSEVOICE_DIR}/cache")
+    print(f"[INFO] WhisperX 模型目录: models/WhisperX")
     print(f"[INFO] 监听地址: http://{HOST}:{PORT}")
     print("="*60 + "\n")
     
