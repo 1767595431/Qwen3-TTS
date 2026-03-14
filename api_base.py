@@ -507,7 +507,7 @@ def _apply_speed_ffmpeg(wav: np.ndarray, sr: int, speed: float) -> np.ndarray:
 
 def _apply_speed(wav, speed: float, sr: int):
     wav = np.asarray(wav, dtype=np.float32)
-    tail_pad = np.zeros(int(sr * 0.3), dtype=np.float32)
+    tail_pad = np.zeros(int(sr * 1.0), dtype=np.float32)
     if speed is None or speed == 1.0:
         return np.concatenate([wav, tail_pad])
     speed = float(speed)
