@@ -579,6 +579,22 @@ def _normalize_text_for_tts(text: str) -> str:
     return text.strip()
 
 
+_TRAILING_PUNCT_RE = re.compile(r'[。！？!?；;，,、：:…]+$')
+
+
+def _ensure_trailing_guard(text: str) -> str:
+    """
+    在文本末尾追加一个"牺牲句号"，迫使模型多生成一小段音频，
+    避免最后一个真实字被截断。如果文本已经以强标点结尾，则不重复添加。
+    """
+    text = text.rstrip()
+    if not text:
+        return text
+    if _TRAILING_PUNCT_RE.search(text):
+        return text + "。"
+    return text + "。"
+
+
 def _apply_polyphonic(text: str) -> str:
     """Clean up text before synthesis: normalise whitespace + strip pinyin annotations."""
     if not text:
@@ -786,8 +802,8 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         # 加载模型
         model = _get_model(params["model"])
         
-        # 处理文本（移除拼音标注）
-        text = _apply_polyphonic(params["text"])
+        # 处理文本（移除拼音标注 + 末尾防截断）
+        text = _ensure_trailing_guard(_apply_polyphonic(params["text"]))
         ref_text = _apply_polyphonic(params["ref_text"])
         
         # 将base64转为临时文件
@@ -892,8 +908,8 @@ def voice_clone_sync(req: VoiceCloneRequest):
         # 加载模型
         model = _get_model(req.model_size)
         
-        # 处理文本
-        text = _apply_polyphonic(req.text)
+        # 处理文本（末尾防截断）
+        text = _ensure_trailing_guard(_apply_polyphonic(req.text))
         ref_text = _apply_polyphonic(req.ref_text)
         
         # 生成语音
