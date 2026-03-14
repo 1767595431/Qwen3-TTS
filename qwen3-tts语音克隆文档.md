@@ -1,22 +1,24 @@
 # 语音克隆接口文档（api_base.py）
 
-> 本文档详细说明 `api_base.py` 提供的所有语音合成与管理接口
+> 本文档详细说明 `api_base.py` 提供的所有语音合成、管理及字幕生成接口
 
 ## 📋 目录
 
 - [系统架构](#系统架构)
 - [接口总览](#接口总览)
 - [核心接口详解](#核心接口详解)
-  - [1. 提交语音克隆任务](#1-提交语音克隆任务)
-  - [2. 查询任务状态](#2-查询任务状态)
-  - [3. 查询用户所有任务](#3-查询用户所有任务)
-  - [4. 删除任务](#4-删除任务)
-  - [5. 下载音频文件](#5-下载音频文件)
-  - [6. 查询队列状态](#6-查询队列状态)
+  - [1. 提交语音克隆任务（异步）](#1-提交语音克隆任务异步)
+  - [2. 语音克隆（同步）](#2-语音克隆同步)
+  - [3. 查询任务状态](#3-查询任务状态)
+  - [4. 查询用户所有任务](#4-查询用户所有任务)
+  - [5. 删除任务](#5-删除任务)
+  - [6. 下载任务文件（音频/字幕）](#6-下载任务文件音频字幕)
+  - [7. 查询队列状态](#7-查询队列状态)
 - [辅助接口](#辅助接口)
-  - [7. 语音识别（ASR）](#7-语音识别asr)
-  - [8. 检查ASR状态](#8-检查asr状态)
-  - [9. 健康检查](#9-健康检查)
+  - [8. 语音识别（ASR）](#8-语音识别asr)
+  - [9. 检查ASR状态](#9-检查asr状态)
+  - [10. 健康检查](#10-健康检查)
+- [字幕生成说明](#字幕生成说明)
 - [完整示例](#完整示例)
 - [错误处理](#错误处理)
 - [注意事项](#注意事项)
@@ -60,13 +62,14 @@
 
 | 接口路径 | 方法 | 功能说明 |
 |---------|------|---------|
-| `/api/clone/upload` | POST | 🔹 提交语音克隆任务（文件上传） |
+| `/api/clone/upload` | POST | 🔹 提交语音克隆任务（异步，文件上传） |
+| `/api/voice-clone` | POST | 🔹 语音克隆（同步，立即返回音频+字幕） |
 | `/api/task/{user_id}/{task_id}` | GET | 🔹 查询指定任务状态 |
 | `/api/tasks/{user_id}` | GET | 🔹 查询用户所有任务列表 |
-| `/api/task/{user_id}/{task_id}` | DELETE | 🔹 删除任务及音频文件 |
-| `/api/download/{user_id}/{task_id}` | GET | 🔹 下载任务生成的音频 |
+| `/api/task/{user_id}/{task_id}` | DELETE | 🔹 删除任务及音频/字幕文件 |
+| `/api/download/{user_id}/{task_id}?type=audio\|srt\|json` | GET | 🔹 下载任务文件（音频/SRT字幕/JSON字幕） |
 | `/api/queue/status` | GET | 🔹 查询任务队列状态 |
-| `/api/asr` | POST | 🔸 语音识别（SenseVoice + GTCRN降噪） |
+| `/api/asr` | POST | 🔸 语音识别（WhisperX + GTCRN降噪） |
 | `/api/asr/status` | GET | 🔸 检查ASR功能是否可用 |
 | `/health` | GET | 🔸 健康检查 |
 
@@ -76,7 +79,7 @@
 
 ## 核心接口详解
 
-### 1. 提交语音克隆任务
+### 1. 提交语音克隆任务（异步）
 
 **接口地址**
 ```
@@ -85,7 +88,7 @@ POST /api/clone/upload
 
 **功能说明**
 
-直接上传音频文件提交语音克隆任务到队列，系统将按顺序异步处理。
+直接上传音频文件提交语音克隆任务到队列，系统将按顺序异步处理。任务完成后会自动生成 SRT 和 JSON 格式的字幕文件（需要 WhisperX 支持）。
 
 **请求方式**
 
@@ -251,7 +254,95 @@ curl -X POST "http://localhost:8001/api/clone/upload" \
 
 ---
 
-### 2. 查询任务状态
+### 2. 语音克隆（同步）
+
+**接口地址**
+```
+POST /api/voice-clone
+```
+
+**功能说明**
+
+同步语音克隆接口，立即返回音频 base64 和内联字幕数据，无需轮询。适合短文本快速合成场景。
+
+**请求方式**
+
+`application/json`
+
+**请求参数**
+
+| 参数名 | 类型 | 必填 | 默认值 | 说明 |
+|-------|------|------|--------|------|
+| `text` | string | ✅ | - | 要合成的目标文本 |
+| `ref_audio_b64` | string | ✅ | - | 参考音频的 base64 编码（纯字符串，不含 DataURL 前缀） |
+| `ref_text` | string | ✅ | - | 参考音频对应的转写文本 |
+| `speed` | float | ❌ | 1.0 | 语速调整系数（0.1-5.0） |
+| `speed_enabled` | boolean | ❌ | true | 是否启用语速调整 |
+| `language` | string | ❌ | English | 目标语言 |
+| `model_size` | string | ❌ | 1.7B | 模型大小：`0.6B` 或 `1.7B` |
+| `x_vector_only_mode` | boolean | ❌ | false | 是否只使用 x-vector 模式 |
+
+**响应示例（含字幕）**
+
+```json
+{
+  "sample_rate": 24000,
+  "audio_b64": "UklGRiQAAABXQVZFZm10IBAAAA...",
+  "subtitle_generated": true,
+  "subtitle_language": "zh",
+  "subtitle_srt": "1\n00:00:00,031 --> 00:00:03,668\n今天天气真不错...\n",
+  "subtitle_json": {
+    "language": "zh",
+    "segments": [
+      {
+        "start": 0.031,
+        "end": 3.668,
+        "text": "今天天气真不错"
+      }
+    ]
+  }
+}
+```
+
+**字幕相关响应字段**
+
+| 字段 | 类型 | 说明 |
+|-----|------|------|
+| `subtitle_generated` | boolean | 字幕是否成功生成 |
+| `subtitle_language` | string | 字幕检测到的语言代码（如 `zh`、`en`） |
+| `subtitle_srt` | string | SRT 格式字幕文本（完整内容） |
+| `subtitle_json` | object | JSON 格式字幕数据（含 segments 数组） |
+| `subtitle_error` | string | 字幕生成失败时的错误信息（仅在失败时出现） |
+
+**响应示例（字幕不可用）**
+
+```json
+{
+  "sample_rate": 24000,
+  "audio_b64": "UklGRiQAAABXQVZFZm10IBAAAA...",
+  "subtitle_generated": false,
+  "subtitle_error": "WhisperX 未安装，无法为合成结果生成字幕"
+}
+```
+
+**cURL示例**
+
+```bash
+curl -X POST "http://localhost:8001/api/voice-clone" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "今天天气真不错，适合出去走走。",
+    "ref_audio_b64": "UklGRiQAAABXQVZFZm10IBAAAA...",
+    "ref_text": "这是参考音频的文本内容",
+    "speed": 1.0,
+    "language": "Chinese",
+    "model_size": "1.7B"
+  }'
+```
+
+---
+
+### 3. 查询任务状态
 
 **接口地址**
 ```
@@ -303,9 +394,13 @@ GET /api/task/{user_id}/{task_id}
   "completed_at": "2026-02-01 10:30:20",
   "audio_url": "http://localhost:8001/api/download/user001/123456789",
   "audio_file": "user001_123456789.wav",
-  "sample_rate": 24000
+  "sample_rate": 24000,
+  "subtitle_srt": "http://localhost:8001/api/download/user001/123456789?type=srt",
+  "subtitle_json": "http://localhost:8001/api/download/user001/123456789?type=json"
 }
 ```
+
+> `subtitle_srt` 和 `subtitle_json` 仅在 WhisperX 可用且字幕生成成功时出现。若字幕生成失败，会返回 `subtitle_error` 字段说明原因。
 
 **状态4：失败（failed）**
 ```json
@@ -335,7 +430,7 @@ curl "http://localhost:8001/api/task/user001/123456789"
 
 ---
 
-### 3. 查询用户所有任务
+### 4. 查询用户所有任务
 
 **接口地址**
 ```
@@ -388,7 +483,7 @@ curl "http://localhost:8001/api/tasks/user001"
 
 ---
 
-### 4. 删除任务
+### 5. 删除任务
 
 **接口地址**
 ```
@@ -423,16 +518,16 @@ curl -X DELETE "http://localhost:8001/api/task/user001/123456789"
 
 ---
 
-### 5. 下载音频文件
+### 6. 下载任务文件（音频/字幕）
 
 **接口地址**
 ```
-GET /api/download/{user_id}/{task_id}
+GET /api/download/{user_id}/{task_id}?type=audio|srt|json
 ```
 
 **功能说明**
 
-下载任务生成的WAV音频文件。
+下载任务生成的文件，支持三种类型：音频（WAV）、SRT 字幕、JSON 字幕。
 
 **路径参数**
 
@@ -441,37 +536,78 @@ GET /api/download/{user_id}/{task_id}
 | `user_id` | string | 用户标识 |
 | `task_id` | string | 任务ID |
 
-**响应**
+**查询参数**
 
-- **成功**：返回音频文件流（WAV格式）
-- **失败**：返回JSON错误信息
+| 参数名 | 类型 | 必填 | 默认值 | 说明 |
+|-------|------|------|--------|------|
+| `type` | string | ❌ | `audio` | 文件类型：`audio`（WAV音频）、`srt`（SRT字幕）、`json`（JSON字幕） |
 
-**响应头**
+**各类型响应**
+
+| type 值 | Content-Type | 文件名示例 | 说明 |
+|---------|-------------|-----------|------|
+| `audio` | `audio/wav` | `user001_123456789.wav` | 生成的语音音频文件 |
+| `srt` | `text/plain; charset=utf-8` | `123456789.srt` | SRT 格式字幕文件 |
+| `json` | `application/json; charset=utf-8` | `123456789_subtitle.json` | JSON 格式字幕数据 |
+
+**SRT 字幕示例**
 
 ```
-Content-Type: audio/wav
-Content-Disposition: attachment; filename="user001_123456789.wav"
+1
+00:00:00,031 --> 00:00:03,668
+今天天气真不错，适合出去走走。
+
+2
+00:00:03,890 --> 00:00:07,250
+阳光明媚，万里无云。
+```
+
+**JSON 字幕示例**
+
+```json
+{
+  "language": "zh",
+  "segments": [
+    {
+      "start": 0.031,
+      "end": 3.668,
+      "text": "今天天气真不错，适合出去走走。"
+    },
+    {
+      "start": 3.890,
+      "end": 7.250,
+      "text": "阳光明媚，万里无云。"
+    }
+  ]
+}
 ```
 
 **cURL示例**
 
 ```bash
-# 直接下载
+# 下载音频（默认）
 curl -O "http://localhost:8001/api/download/user001/123456789"
 
-# 保存为指定文件名
-curl "http://localhost:8001/api/download/user001/123456789" -o output.wav
+# 下载 SRT 字幕
+curl "http://localhost:8001/api/download/user001/123456789?type=srt" -o output.srt
+
+# 下载 JSON 字幕
+curl "http://localhost:8001/api/download/user001/123456789?type=json" -o subtitle.json
 ```
 
-**浏览器访问**
+**错误响应**
 
+```json
+{
+  "detail": "SRT 字幕文件不存在（WhisperX 可能未安装或生成失败）"
+}
 ```
-http://localhost:8001/api/download/user001/123456789
-```
+
+> 字幕文件在任务完成时由 WhisperX 自动生成。如果 WhisperX 未安装或字幕生成失败，对应的字幕文件将不存在，但不影响音频文件的正常下载。
 
 ---
 
-### 6. 查询队列状态
+### 7. 查询队列状态
 
 **接口地址**
 ```
@@ -508,7 +644,7 @@ curl "http://localhost:8001/api/queue/status"
 
 ## 辅助接口
 
-### 7. 语音识别（ASR）
+### 8. 语音识别（ASR）
 
 **接口地址**
 ```
@@ -517,7 +653,7 @@ POST /api/asr
 
 **功能说明**
 
-使用 **SenseVoice + GTCRN降噪** 识别音频文本，用于自动生成 `ref_text`。
+使用 **WhisperX + GTCRN降噪** 识别音频文本，用于自动生成 `ref_text`。WhisperX 同时也被用于字幕生成中的时间戳对齐。
 
 **请求方式**
 
@@ -532,7 +668,7 @@ POST /api/asr
 **处理流程**
 
 ```
-上传音频 → GTCRN降噪（16kHz wav）→ SenseVoice识别 → 返回文本
+上传音频 → GTCRN降噪增强(可选) → WhisperX 识别 → 返回文本
 ```
 
 **响应示例**
@@ -547,7 +683,7 @@ POST /api/asr
 
 ```json
 {
-  "detail": "SenseVoice 未就绪。请安装: pip install -U funasr modelscope"
+  "detail": "WhisperX 未就绪。请安装: pip install whisperx"
 }
 ```
 
@@ -575,7 +711,7 @@ curl -X POST "http://localhost:8001/api/asr" \
 
 ---
 
-### 8. 检查ASR状态
+### 9. 检查ASR状态
 
 **接口地址**
 ```
@@ -584,7 +720,7 @@ GET /api/asr/status
 
 **功能说明**
 
-检查 SenseVoice 和 GTCRN 降噪功能是否可用。
+检查 WhisperX 语音识别和 GTCRN 降噪功能是否可用。WhisperX 同时负责语音识别和字幕时间戳生成。
 
 **响应示例**
 
@@ -592,7 +728,7 @@ GET /api/asr/status
 {
   "available": true,
   "enhancer": true,
-  "duration_min": 5,
+  "duration_min": 3,
   "duration_max": 15
 }
 ```
@@ -601,8 +737,8 @@ GET /api/asr/status
 
 | 字段 | 类型 | 说明 |
 |-----|------|------|
-| `available` | boolean | SenseVoice是否可用 |
-| `enhancer` | boolean | GTCRN降噪是否可用 |
+| `available` | boolean | WhisperX 是否可用（影响 ASR 和字幕生成） |
+| `enhancer` | boolean | GTCRN 降噪是否可用 |
 | `duration_min` | integer | 最小音频时长（秒） |
 | `duration_max` | integer | 最大音频时长（秒） |
 
@@ -614,7 +750,7 @@ curl "http://localhost:8001/api/asr/status"
 
 ---
 
-### 9. 健康检查
+### 10. 健康检查
 
 **接口地址**
 ```
@@ -638,6 +774,65 @@ GET /health
 ```bash
 curl "http://localhost:8001/health"
 ```
+
+---
+
+## 字幕生成说明
+
+### 工作原理
+
+系统在语音合成完成后，自动使用 **WhisperX** 对生成的音频进行语音识别和强制对齐，从而产生精确的时间戳字幕。如果提交任务时提供了原文（`text` 字段），字幕文本将使用原文而非 ASR 识别结果，确保文字完全准确。
+
+```
+TTS 合成音频 → WhisperX 识别 + 强制对齐 → 原文对齐匹配 → 生成 SRT + JSON 字幕
+```
+
+### 两种接口的字幕返回方式
+
+| 接口 | 字幕返回方式 | 说明 |
+|-----|-------------|------|
+| `POST /api/voice-clone`（同步） | 响应 JSON 中内联返回 | `subtitle_srt`（SRT文本）、`subtitle_json`（JSON对象）直接包含在响应体中 |
+| `POST /api/clone/upload`（异步） | 通过下载接口获取 | 任务完成后，`subtitle_srt` 和 `subtitle_json` 字段包含下载 URL |
+
+### 字幕输出格式
+
+**SRT 格式**（标准字幕格式，兼容各类播放器）
+
+```
+1
+00:00:00,031 --> 00:00:03,668
+3月5日，参加江苏代表团审议，
+
+2
+00:00:03,890 --> 00:00:09,123
+习近平总书记就抓好"十五五"经济社会发展提出明确要求，
+```
+
+**JSON 格式**（结构化数据，方便程序处理）
+
+```json
+{
+  "language": "zh",
+  "segments": [
+    {
+      "start": 0.031,
+      "end": 3.668,
+      "text": "3月5日，参加江苏代表团审议，"
+    },
+    {
+      "start": 3.890,
+      "end": 9.123,
+      "text": "习近平总书记就抓好"十五五"经济社会发展提出明确要求，"
+    }
+  ]
+}
+```
+
+### 前置条件
+
+- 需要安装 WhisperX：`pip install whisperx`
+- 首次使用时会自动下载 WhisperX 模型（需要网络访问 HuggingFace）
+- 字幕生成失败不会影响 TTS 主流程，音频文件依然正常返回
 
 ---
 
@@ -1089,8 +1284,8 @@ Qwen3-TTS 支持 **10种主要语言** 以及自动语言检测：
 ## 联系与支持
 
 - **项目地址**：[Qwen3-TTS GitHub](https://github.com/QwenLM/Qwen3-TTS)
-- **文档更新日期**：2026-02-01
-- **API版本**：v1.0
+- **文档更新日期**：2026-03-06
+- **API版本**：v1.1
 
 ---
 

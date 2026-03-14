@@ -13,9 +13,11 @@ import sys
 import time
 import threading
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Tuple, List, Optional, Any
 from queue import Queue
+
+import requests as http_requests
 
 warnings.filterwarnings("ignore", message="torchcodec is not installed")
 warnings.filterwarnings("ignore", message="Passing `gradient_checkpointing` to a config")
@@ -537,7 +539,21 @@ class VoiceCloneRequest(BaseModel):
     x_vector_only_mode: bool = Field(False, description="是否只使用 x-vector 模式")
 
 
-app = FastAPI(title="Qwen3-TTS 语音克隆 API")
+from xfyun_service import translate_router, XFYUN_TAGS
+
+tags_metadata = [
+    {"name": "系统", "description": "健康检查、页面等基础接口"},
+    {"name": "语音识别", "description": "WhisperX 语音识别（ASR）"},
+    {"name": "语音克隆", "description": "Qwen3-TTS 语音合成与克隆"},
+    {"name": "任务管理", "description": "异步语音克隆任务的查询、下载、删除"},
+] + XFYUN_TAGS
+
+app = FastAPI(
+    title="Qwen3-TTS 语音克隆 API",
+    description="语音合成、语音克隆、语音识别、讯飞机器翻译",
+    openapi_tags=tags_metadata,
+)
+app.include_router(translate_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -601,17 +617,22 @@ def startup_preload_models():
     # 注意：实际端口在 main 启动时才确定，这里先不打印
 
 
-@app.get("/")
+@app.get("/", tags=["系统"], summary="主页")
 def index():
     return FileResponse(INDEX_FILE)
 
 
-@app.get("/health")
+@app.get("/xfyun", tags=["系统"], summary="讯飞 AI 服务页面")
+def xfyun_page():
+    return FileResponse(os.path.join(WEB_DIR, "xfyun.html"))
+
+
+@app.get("/health", tags=["系统"], summary="健康检查")
 def health():
     return {"ok": True}
 
 
-@app.get("/api/asr/status")
+@app.get("/api/asr/status", tags=["语音识别"], summary="语音识别状态")
 def asr_status():
     """
     检查 WhisperX 语音识别和 GTCRN 降噪是否可用
@@ -625,7 +646,7 @@ def asr_status():
     }
 
 
-@app.post("/api/asr")
+@app.post("/api/asr", tags=["语音识别"], summary="语音识别（WhisperX）")
 async def recognize_audio(file: UploadFile = File(...)):
     """
     使用 WhisperX 识别参考音频文本
@@ -795,7 +816,7 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
                 pass
 
 
-@app.post("/api/voice-clone")
+@app.post("/api/voice-clone", tags=["语音克隆"], summary="语音克隆（同步）")
 def voice_clone_sync(req: VoiceCloneRequest):
     """
     同步语音克隆接口（立即返回音频 base64）
@@ -856,7 +877,7 @@ def voice_clone_sync(req: VoiceCloneRequest):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.post("/api/clone/upload")
+@app.post("/api/clone/upload", tags=["语音克隆"], summary="提交语音克隆任务（异步上传）")
 async def submit_voice_clone_task_upload(
     user_id: str = Form(...),
     text: str = Form(...),
@@ -965,7 +986,7 @@ def _base_url(request: Request) -> str:
     return f"{scheme}://{netloc}"
 
 
-@app.get("/api/task/{user_id}/{task_id}")
+@app.get("/api/task/{user_id}/{task_id}", tags=["任务管理"], summary="查询任务状态")
 def get_task_status(user_id: str, task_id: str, request: Request):
     """
     查询指定任务的状态
@@ -1003,7 +1024,7 @@ def get_task_status(user_id: str, task_id: str, request: Request):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.get("/api/tasks/{user_id}")
+@app.get("/api/tasks/{user_id}", tags=["任务管理"], summary="查询用户所有任务")
 def list_user_tasks(user_id: str, request: Request):
     """
     查询用户的所有任务
@@ -1034,7 +1055,7 @@ def list_user_tasks(user_id: str, request: Request):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.delete("/api/task/{user_id}/{task_id}")
+@app.delete("/api/task/{user_id}/{task_id}", tags=["任务管理"], summary="删除任务")
 def delete_task(user_id: str, task_id: str):
     """删除指定任务（包括音频文件）"""
     try:
@@ -1048,7 +1069,7 @@ def delete_task(user_id: str, task_id: str):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.get("/api/download/{user_id}/{task_id}")
+@app.get("/api/download/{user_id}/{task_id}", tags=["任务管理"], summary="下载任务文件")
 def download_file(user_id: str, task_id: str, type: str = Query("audio", regex="^(audio|srt|json)$")):
     """
     下载任务生成的文件

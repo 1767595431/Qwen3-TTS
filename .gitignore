@@ -43,6 +43,9 @@ tasks/*.json
 # Large assets
 assets/*.pdf
 
+# Config with secrets
+config.ini
+
 # Audio files
 *.wav
 *.mp3
