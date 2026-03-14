@@ -539,21 +539,18 @@ class VoiceCloneRequest(BaseModel):
     x_vector_only_mode: bool = Field(False, description="是否只使用 x-vector 模式")
 
 
-from xfyun_service import translate_router, XFYUN_TAGS
-
 tags_metadata = [
     {"name": "系统", "description": "健康检查、页面等基础接口"},
     {"name": "语音识别", "description": "WhisperX 语音识别（ASR）"},
     {"name": "语音克隆", "description": "Qwen3-TTS 语音合成与克隆"},
     {"name": "任务管理", "description": "异步语音克隆任务的查询、下载、删除"},
-] + XFYUN_TAGS
+]
 
 app = FastAPI(
     title="Qwen3-TTS 语音克隆 API",
-    description="语音合成、语音克隆、语音识别、讯飞机器翻译",
+    description="语音合成、语音克隆、语音识别",
     openapi_tags=tags_metadata,
 )
-app.include_router(translate_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -620,11 +617,6 @@ def startup_preload_models():
 @app.get("/", tags=["系统"], summary="主页")
 def index():
     return FileResponse(INDEX_FILE)
-
-
-@app.get("/xfyun", tags=["系统"], summary="讯飞 AI 服务页面")
-def xfyun_page():
-    return FileResponse(os.path.join(WEB_DIR, "xfyun.html"))
 
 
 @app.get("/health", tags=["系统"], summary="健康检查")
