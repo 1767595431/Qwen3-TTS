@@ -13,13 +13,16 @@ import sys
 import time
 import threading
 import warnings
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Dict, Tuple, List, Optional, Any
 from queue import Queue
 
 import requests as http_requests
 
-warnings.filterwarnings("ignore", message="torchcodec is not installed")
+# 屏蔽 pyannote/torchcodec 的 torchcodec 加载失败警告（不影响 WhisperX 功能）
+warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
+warnings.filterwarnings("ignore", category=UserWarning, module="torchcodec")
 warnings.filterwarnings("ignore", message="Passing `gradient_checkpointing` to a config")
 
 import logging
@@ -546,21 +549,8 @@ tags_metadata = [
     {"name": "任务管理", "description": "异步语音克隆任务的查询、下载、删除"},
 ]
 
-app = FastAPI(
-    title="Qwen3-TTS 语音克隆 API",
-    description="语音合成、语音克隆、语音识别",
-    openapi_tags=tags_metadata,
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-
-@app.on_event("startup")
-def startup_preload_models():
+def _startup_preload_models():
     """启动时预加载所有模型"""
     print("\n" + "="*60)
     print("正在启动 Qwen3-TTS 语音克隆服务...")
@@ -610,8 +600,26 @@ def startup_preload_models():
 
     # 3. 启动任务队列工作线程
     _start_queue_worker()
-    
-    # 注意：实际端口在 main 启动时才确定，这里先不打印
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    _startup_preload_models()
+    yield
+
+
+app = FastAPI(
+    title="Qwen3-TTS 语音克隆 API",
+    description="语音合成、语音克隆、语音识别",
+    openapi_tags=tags_metadata,
+    lifespan=_lifespan,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/", tags=["系统"], summary="主页")
@@ -1062,7 +1070,7 @@ def delete_task(user_id: str, task_id: str):
 
 
 @app.get("/api/download/{user_id}/{task_id}", tags=["任务管理"], summary="下载任务文件")
-def download_file(user_id: str, task_id: str, type: str = Query("audio", regex="^(audio|srt|json)$")):
+def download_file(user_id: str, task_id: str, type: str = Query("audio", pattern="^(audio|srt|json)$")):
     """
     下载任务生成的文件
 

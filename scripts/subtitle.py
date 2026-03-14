@@ -70,6 +70,14 @@ def _ensure_whisperx_model_dir() -> str:
     return WHISPERX_MODEL_DIR
 
 
+def _use_local_only() -> bool:
+    """有本地缓存或显式设置离线时，仅用本地模型，不发起网络请求。"""
+    if os.getenv("QWEN_TTS_SUBTITLE_OFFLINE", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    status = get_whisperx_cache_status()
+    return bool(status.get("has_cache"))
+
+
 def get_whisperx_cache_status() -> Dict[str, object]:
     """Return local WhisperX cache directory status for startup checks."""
     model_dir = _ensure_whisperx_model_dir()
@@ -118,11 +126,13 @@ def _get_whisperx_model():
     device = _subtitle_device()
     compute_type = _subtitle_compute_type(device)
     model_dir = _ensure_whisperx_model_dir()
+    local_only = _use_local_only()
     _WHISPERX_MODEL = whisperx.load_model(
         _subtitle_model_name(),
         device,
         compute_type=compute_type,
         download_root=model_dir,
+        local_files_only=local_only,
     )
     return _WHISPERX_MODEL
 
@@ -133,10 +143,12 @@ def _get_align_model(language_code: str):
 
     device = _subtitle_device()
     model_dir = _ensure_whisperx_model_dir()
+    cache_only = _use_local_only()
     model_a, metadata = whisperx.load_align_model(
         language_code=language_code,
         device=device,
         model_dir=model_dir,
+        model_cache_only=cache_only,
     )
     _WHISPERX_ALIGN_MODELS[language_code] = (model_a, metadata)
     return model_a, metadata
