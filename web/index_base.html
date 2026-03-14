@@ -281,7 +281,10 @@
           <button id="closeTasks" class="icon-btn">关闭</button>
         </div>
         <div class="modal-body"><div id="tasksList" style="min-height:200px;"></div></div>
-        <div style="margin-top:12px;"><button id="refreshTasks" class="secondary">刷新列表</button></div>
+        <div style="margin-top:12px;display:flex;gap:10px;">
+          <button id="refreshTasks" class="secondary">刷新列表</button>
+          <button id="clearAllTasks" class="secondary" style="color:#f87171;border-color:#f87171;">一键清除所有任务</button>
+        </div>
       </div>
     </div>
 
@@ -782,6 +785,25 @@
       document.getElementById("closePreviewModal").addEventListener("click", closeTaskPreviewModal);
       document.getElementById("refreshTasks").addEventListener("click", async () => {
         await loadUserTasks(document.getElementById("modalUserId").textContent);
+      });
+
+      document.getElementById("clearAllTasks").addEventListener("click", async () => {
+        if (!confirm("确认清除所有任务？正在执行中的任务不会被删除。")) return;
+        const btn = document.getElementById("clearAllTasks");
+        btn.disabled = true;
+        btn.textContent = "清除中...";
+        try {
+          const resp = await fetch("/api/tasks/clear", { method: "DELETE" });
+          const data = await resp.json();
+          if (!resp.ok) { alert("清除失败: " + (data.detail || "未知错误")); return; }
+          alert(`已清除 ${data.deleted} 个任务${data.skipped_processing > 0 ? "，保留 " + data.skipped_processing + " 个执行中的任务" : ""}`);
+          await loadUserTasks(document.getElementById("modalUserId").textContent);
+        } catch (e) {
+          alert("清除失败: " + e.message);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "一键清除所有任务";
+        }
       });
 
       async function openTaskPreview(userId, taskId) {

@@ -177,6 +177,59 @@ def _get_user_tasks(user_id: str) -> List[Dict]:
         return user_tasks
 
 
+def _clear_all_tasks() -> Dict[str, int]:
+    """清除所有非 processing 状态的任务及其文件，返回统计。"""
+    deleted = 0
+    skipped = 0
+
+    with _TASKS_LOCK:
+        keys_to_delete = []
+        for key, task in _TASKS_STORE.items():
+            if task.get("status") == "processing":
+                skipped += 1
+                continue
+            keys_to_delete.append(key)
+
+        for key in keys_to_delete:
+            task = _TASKS_STORE.pop(key)
+            if task.get("audio_file"):
+                audio_path = os.path.join(AUDIO_OUTPUT_DIR, task["audio_file"])
+                srt_path, json_path = _subtitle_paths_for_audio(audio_path)
+                for p in (audio_path, srt_path, json_path):
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+            deleted += 1
+
+    for filename in os.listdir(TASKS_DIR):
+        if not filename.endswith(".json"):
+            continue
+        task_file = os.path.join(TASKS_DIR, filename)
+        try:
+            with open(task_file, "r", encoding="utf-8") as f:
+                task_data = json.load(f)
+            if task_data.get("status") == "processing":
+                skipped += 1
+                continue
+            os.remove(task_file)
+            if task_data.get("audio_file"):
+                audio_path = os.path.join(AUDIO_OUTPUT_DIR, task_data["audio_file"])
+                srt_path, json_path = _subtitle_paths_for_audio(audio_path)
+                for p in (audio_path, srt_path, json_path):
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+            deleted += 1
+        except Exception:
+            pass
+
+    return {"deleted": deleted, "skipped_processing": skipped}
+
+
 def _queue_worker():
     """队列工作线程，依次处理任务"""
     while True:
@@ -465,26 +518,31 @@ def _apply_speed(wav, speed: float, sr: int):
     return np.concatenate([stretched, tail_pad])
 
 
+def _clean_b64(raw: str) -> str:
+    """去除 base64 字符串中的非 ASCII 字符和空白，防止 b64decode 报错。"""
+    return re.sub(r'[^A-Za-z0-9+/=]', '', raw)
+
+
 def _get_audio_duration_seconds(path_or_b64: str) -> float:
     """
     获取音频时长（秒）。
     path_or_b64: 文件路径 或 base64 字符串（支持 data:audio/...;base64,XXX 或纯 base64）
     """
     path_or_b64 = path_or_b64.strip()
-    
+
     # 1. 处理 data:audio 格式
-    if path_or_b64.startswith("data:"):
+    if path_or_b64.startswith("data:") or "," in path_or_b64:
         raw = path_or_b64.split(",", 1)[1] if "," in path_or_b64 else path_or_b64
-        data_bytes = base64.b64decode(raw)
+        data_bytes = base64.b64decode(_clean_b64(raw))
         data, sr = sf.read(io.BytesIO(data_bytes), dtype="float32", always_2d=False)
-    
+
     # 2. 检查是否为文件路径（必须实际存在）
     elif os.path.isfile(path_or_b64):
         data, sr = sf.read(path_or_b64, dtype="float32", always_2d=False)
-    
+
     # 3. 作为纯base64解码
     else:
-        data_bytes = base64.b64decode(path_or_b64)
+        data_bytes = base64.b64decode(_clean_b64(path_or_b64))
         data, sr = sf.read(io.BytesIO(data_bytes), dtype="float32", always_2d=False)
     
     if data.ndim > 1:
@@ -733,10 +791,10 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         ref_text = _apply_polyphonic(params["ref_text"])
         
         # 将base64转为临时文件
-        ref_audio_b64 = params["ref_audio_b64"]
-        if ref_audio_b64.startswith("data:"):
+        ref_audio_b64 = params["ref_audio_b64"].strip()
+        if "," in ref_audio_b64:
             ref_audio_b64 = ref_audio_b64.split(",", 1)[1]
-        
+        ref_audio_b64 = re.sub(r'[^A-Za-z0-9+/=]', '', ref_audio_b64)
         audio_bytes = base64.b64decode(ref_audio_b64)
         ref_audio_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         ref_audio_tmp.write(audio_bytes)
@@ -1067,6 +1125,24 @@ def delete_task(user_id: str, task_id: str):
         raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/tasks/clear", tags=["任务管理"], summary="一键清除所有任务")
+def clear_all_tasks():
+    """
+    清除所有任务及其音频/字幕文件。
+
+    正在执行中（processing）的任务会被保留，其余全部删除。
+    """
+    try:
+        result = _clear_all_tasks()
+        return {
+            "message": "清除完成",
+            "deleted": result["deleted"],
+            "skipped_processing": result["skipped_processing"],
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"清除失败: {str(exc)}")
 
 
 @app.get("/api/download/{user_id}/{task_id}", tags=["任务管理"], summary="下载任务文件")

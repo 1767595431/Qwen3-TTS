@@ -12,12 +12,13 @@
   - [3. 查询任务状态](#3-查询任务状态)
   - [4. 查询用户所有任务](#4-查询用户所有任务)
   - [5. 删除任务](#5-删除任务)
-  - [6. 下载任务文件（音频/字幕）](#6-下载任务文件音频字幕)
-  - [7. 查询队列状态](#7-查询队列状态)
+  - [6. 一键清除所有任务](#6-一键清除所有任务)
+  - [7. 下载任务文件（音频/字幕）](#7-下载任务文件音频字幕)
+  - [8. 查询队列状态](#8-查询队列状态)
 - [辅助接口](#辅助接口)
-  - [8. 语音识别（ASR）](#8-语音识别asr)
-  - [9. 检查ASR状态](#9-检查asr状态)
-  - [10. 健康检查](#10-健康检查)
+  - [9. 语音识别（ASR）](#9-语音识别asr)
+  - [10. 检查ASR状态](#10-检查asr状态)
+  - [11. 健康检查](#11-健康检查)
 - [字幕生成说明](#字幕生成说明)
 - [完整示例](#完整示例)
 - [错误处理](#错误处理)
@@ -67,6 +68,7 @@
 | `/api/task/{user_id}/{task_id}` | GET | 🔹 查询指定任务状态 |
 | `/api/tasks/{user_id}` | GET | 🔹 查询用户所有任务列表 |
 | `/api/task/{user_id}/{task_id}` | DELETE | 🔹 删除任务及音频/字幕文件 |
+| `/api/tasks/clear` | DELETE | 🔹 一键清除所有任务（保留执行中的） |
 | `/api/download/{user_id}/{task_id}?type=audio\|srt\|json` | GET | 🔹 下载任务文件（音频/SRT字幕/JSON字幕） |
 | `/api/queue/status` | GET | 🔹 查询任务队列状态 |
 | `/api/asr` | POST | 🔸 语音识别（WhisperX + GTCRN降噪） |
@@ -518,7 +520,56 @@ curl -X DELETE "http://localhost:8001/api/task/user001/123456789"
 
 ---
 
-### 6. 下载任务文件（音频/字幕）
+### 6. 一键清除所有任务
+
+**接口地址**
+```
+DELETE /api/tasks/clear
+```
+
+**功能说明**
+
+清除所有任务及其关联的音频、字幕文件。**正在执行中（processing）的任务会被保留**，其余状态的任务（pending、completed、failed）全部删除。
+
+**请求参数**
+
+无
+
+**响应示例**
+
+```json
+{
+  "message": "清除完成",
+  "deleted": 12,
+  "skipped_processing": 1
+}
+```
+
+**响应字段说明**
+
+| 字段 | 类型 | 说明 |
+|-----|------|------|
+| `message` | string | 操作结果提示 |
+| `deleted` | integer | 已删除的任务数量 |
+| `skipped_processing` | integer | 保留的执行中任务数量 |
+
+**cURL示例**
+
+```bash
+curl -X DELETE "http://localhost:8001/api/tasks/clear"
+```
+
+**JavaScript示例**
+
+```javascript
+const resp = await fetch('/api/tasks/clear', { method: 'DELETE' });
+const data = await resp.json();
+console.log(`已清除 ${data.deleted} 个任务，保留 ${data.skipped_processing} 个执行中的任务`);
+```
+
+---
+
+### 7. 下载任务文件（音频/字幕）
 
 **接口地址**
 ```
@@ -607,7 +658,7 @@ curl "http://localhost:8001/api/download/user001/123456789?type=json" -o subtitl
 
 ---
 
-### 7. 查询队列状态
+### 8. 查询队列状态
 
 **接口地址**
 ```
@@ -644,7 +695,7 @@ curl "http://localhost:8001/api/queue/status"
 
 ## 辅助接口
 
-### 8. 语音识别（ASR）
+### 9. 语音识别（ASR）
 
 **接口地址**
 ```
@@ -711,7 +762,7 @@ curl -X POST "http://localhost:8001/api/asr" \
 
 ---
 
-### 9. 检查ASR状态
+### 10. 检查ASR状态
 
 **接口地址**
 ```
@@ -750,7 +801,7 @@ curl "http://localhost:8001/api/asr/status"
 
 ---
 
-### 10. 健康检查
+### 11. 健康检查
 
 **接口地址**
 ```
