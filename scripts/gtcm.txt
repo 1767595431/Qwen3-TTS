@@ -1,0 +1,16 @@
+GTCRN 降噪模块修复记录 (gtcrn.py)
+=====================================
+
+问题：enhance_audio 函数中 torch.stft 的输出维度处理错误，导致降噪始终失败。
+
+原因：
+  - torch.stft 输出已经是 (B, F, T, 2) 格式，与 GTCRN 模型 forward 期望的输入一致
+  - 但代码中多了一行 spec.permute(0, 2, 3, 1)，将维度错误地转成了 (B, T, 2, F)
+  - 模型内部矩阵乘法因此报错：mat1 and mat2 shapes cannot be multiplied
+  - 降噪从未真正成功过，一直走的 fallback（直接识别）
+
+修复：
+  1. 删除错误的 spec.permute(0, 2, 3, 1)
+  2. torch.stft 改用 return_complex=True（消除 deprecated 警告）
+  3. 通过 torch.view_as_real() 转为 (B, F, T, 2) 实虚部格式传入模型
+  4. 模型输出通过 torch.view_as_complex() 转回复数张量，再传给 torch.istft
