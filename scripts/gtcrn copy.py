@@ -390,16 +390,14 @@ def enhance_audio(input_path: str, output_path: str, checkpoint_path: str, devic
             continue
         
         x = torch.from_numpy(chunk).float().unsqueeze(0).to(device)
-        spec = torch.stft(x, GTCRN_NFFT, GTCRN_HOP, GTCRN_WIN, window, return_complex=True)
-        spec = torch.view_as_real(spec)  # (B, F, T, 2)
-
+        spec = torch.stft(x, GTCRN_NFFT, GTCRN_HOP, GTCRN_WIN, window, return_complex=False)
+        spec = spec.permute(0, 2, 3, 1)
+        
         with torch.no_grad():
-            spec_enh = model(spec)  # (B, F, T, 2)
-
-        out = torch.istft(
-            torch.view_as_complex(spec_enh.contiguous()),
-            GTCRN_NFFT, GTCRN_HOP, GTCRN_WIN, window,
-        )
+            spec_enh = model(spec)  # 输出 (B, F, T, 2)
+        
+        # spec_enh 为 (B, F, T, 2)，istft 需要 (B, F, T, 2) 实虚部格式
+        out = torch.istft(spec_enh, GTCRN_NFFT, GTCRN_HOP, GTCRN_WIN, window, return_complex=False)
         out_chunks.append(out.cpu().numpy().squeeze(0))
     
     if not out_chunks:

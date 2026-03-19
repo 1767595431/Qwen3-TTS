@@ -772,6 +772,8 @@ async def recognize_audio(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"识别失败: {str(e)}")
     finally:
         if tmp_path:
