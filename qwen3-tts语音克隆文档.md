@@ -66,7 +66,7 @@
 | `/api/clone/upload` | POST | 🔹 提交语音克隆任务（异步，文件上传） |
 | `/api/voice-clone` | POST | 🔹 语音克隆（同步，立即返回音频+字幕） |
 | `/api/task/{user_id}/{task_id}` | GET | 🔹 查询指定任务状态 |
-| `/api/tasks/{user_id}` | GET | 🔹 查询用户所有任务列表 |
+| `/api/tasks/{user_id}` | GET | 🔹 查询用户任务列表（分页，超期自动清理） |
 | `/api/task/{user_id}/{task_id}` | DELETE | 🔹 删除任务及音频/字幕文件 |
 | `/api/tasks/clear` | DELETE | 🔹 一键清除所有任务（保留执行中的） |
 | `/api/download/{user_id}/{task_id}?type=audio\|srt\|json` | GET | 🔹 下载任务文件（音频/SRT字幕/JSON字幕） |
@@ -434,14 +434,14 @@ curl "http://localhost:8001/api/task/user001/123456789"
 
 ### 4. 查询用户所有任务
 
-**接口地址**
+**接口地址**（支持分页）
 ```
 GET /api/tasks/{user_id}
 ```
 
 **功能说明**
 
-获取指定用户的所有任务列表（按创建时间倒序）。
+获取指定用户的任务列表（按创建时间倒序），支持分页。每次调用会先执行**过期清理**：删除全局所有创建时间超过 **7 天**（默认）的任务，**包括仍为 `processing` 的僵死任务**（视为失败）；保留天数可通过环境变量 `QWEN_TTS_TASK_RETENTION_DAYS` 修改。服务启动时也会执行一次过期清理。
 
 **路径参数**
 
@@ -449,38 +449,46 @@ GET /api/tasks/{user_id}
 |-------|------|------|
 | `user_id` | string | 用户标识 |
 
+**查询参数**
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|-------|------|--------|------|
+| `page` | int | 1 | 页码，从 1 开始 |
+| `page_size` | int | 10 | 每页条数，1–100 |
+
 **响应示例**
 
 ```json
 {
   "user_id": "user001",
-  "total": 5,
+  "total": 25,
+  "page": 1,
+  "page_size": 10,
+  "total_pages": 3,
+  "retention_days": 7,
+  "stats": {
+    "completed": 18,
+    "processing": 1,
+    "pending": 2,
+    "failed": 4
+  },
   "tasks": [
     {
       "task_id": "123456789",
       "status": "completed",
       "created_at": "2026-02-01 10:30:00",
       "audio_url": "http://localhost:8001/api/download/user001/123456789"
-    },
-    {
-      "task_id": "123456788",
-      "status": "processing",
-      "created_at": "2026-02-01 10:25:00"
-    },
-    {
-      "task_id": "123456787",
-      "status": "failed",
-      "created_at": "2026-02-01 10:20:00",
-      "error": "音频时长不符合要求"
     }
   ]
 }
 ```
 
+`tasks` 仅为当前页数据；`stats` 为**该用户全部任务**的状态统计（与分页无关）。
+
 **cURL示例**
 
 ```bash
-curl "http://localhost:8001/api/tasks/user001"
+curl "http://localhost:8001/api/tasks/user001?page=1&page_size=10"
 ```
 
 ---

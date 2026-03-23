@@ -9,12 +9,13 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import threading
 import warnings
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, List, Optional, Any
 from queue import Queue
 
@@ -48,17 +49,23 @@ MODEL_DIR = os.path.join(APP_DIR, "models")
 WEB_DIR = os.path.join(APP_DIR, "web")
 INDEX_FILE = os.path.join(WEB_DIR, "index_base.html")
 TASKS_DIR = os.path.join(APP_DIR, "tasks")
+# 任务保留天数，超过则自动删除（含僵死的 processing，视为失败）；可用环境变量覆盖
+TASK_RETENTION_DAYS = int(os.getenv("QWEN_TTS_TASK_RETENTION_DAYS", "7"))
 AUDIO_OUTPUT_DIR = os.path.join(TASKS_DIR, "audio")
+REF_AUDIO_DIR = os.path.join(TASKS_DIR, "ref_audio")
 SCRIPTS_DIR = os.path.join(APP_DIR, "scripts")
 GTCRN_MODEL_PATH = os.path.join(SCRIPTS_DIR, "model_trained_on_dns3.tar")
 
 # 参考音频时长限制（秒）
 REF_AUDIO_DURATION_MIN = 3.0  # 官方支持3秒快速克隆
 REF_AUDIO_DURATION_MAX = 15.0
+# 参考音频目标采样率：上传直接落盘；仅当检测不是 16kHz 时才用 ffmpeg 转码
+REF_AUDIO_TARGET_SR = 16000
 
 # 确保任务目录存在
 os.makedirs(TASKS_DIR, exist_ok=True)
 os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
+os.makedirs(REF_AUDIO_DIR, exist_ok=True)
 
 
 def _resolve_model_path(model_size: str) -> str:
@@ -129,9 +136,26 @@ def _get_task(user_id: str, task_id: str) -> Optional[Dict]:
     return None
 
 
+def _delete_ref_audio_file_if_any(params: Optional[Dict]) -> None:
+    """删除任务参数中保存的本地参考音频（tasks/ref_audio/ 下）。"""
+    if not params:
+        return
+    rel = params.get("ref_audio_rel")
+    if not rel or not isinstance(rel, str):
+        return
+    p = os.path.join(TASKS_DIR, rel.replace("/", os.sep))
+    if os.path.isfile(p):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
 def _delete_task(user_id: str, task_id: str) -> bool:
-    """删除任务：从内存和文件移除，并删除音频文件。返回是否成功。"""
+    """删除任务：从内存和文件移除，并删除输出音频与参考音频文件。返回是否成功。"""
     task_data = _get_task(user_id, task_id)
+    if task_data:
+        _delete_ref_audio_file_if_any(task_data.get("params"))
     if task_data and task_data.get("audio_file"):
         audio_path = os.path.join(AUDIO_OUTPUT_DIR, task_data["audio_file"])
         srt_path, json_path = _subtitle_paths_for_audio(audio_path)
@@ -192,6 +216,7 @@ def _clear_all_tasks() -> Dict[str, int]:
 
         for key in keys_to_delete:
             task = _TASKS_STORE.pop(key)
+            _delete_ref_audio_file_if_any(task.get("params"))
             if task.get("audio_file"):
                 audio_path = os.path.join(AUDIO_OUTPUT_DIR, task["audio_file"])
                 srt_path, json_path = _subtitle_paths_for_audio(audio_path)
@@ -214,6 +239,7 @@ def _clear_all_tasks() -> Dict[str, int]:
                 skipped += 1
                 continue
             os.remove(task_file)
+            _delete_ref_audio_file_if_any(task_data.get("params"))
             if task_data.get("audio_file"):
                 audio_path = os.path.join(AUDIO_OUTPUT_DIR, task_data["audio_file"])
                 srt_path, json_path = _subtitle_paths_for_audio(audio_path)
@@ -228,6 +254,61 @@ def _clear_all_tasks() -> Dict[str, int]:
             pass
 
     return {"deleted": deleted, "skipped_processing": skipped}
+
+
+def _parse_task_created_at(task: Dict) -> Optional[datetime]:
+    """解析任务 created_at 为本地 naive datetime。"""
+    raw = task.get("created_at")
+    if not raw or not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return datetime.strptime(raw[:26], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _purge_tasks_older_than_days(days: Optional[int] = None) -> int:
+    """删除创建时间超过指定天数的任务（含仍为 processing 的僵死任务，视为失败）。返回删除数量。"""
+    d = days if days is not None else TASK_RETENTION_DAYS
+    if d <= 0:
+        return 0
+    if not os.path.isdir(TASKS_DIR):
+        return 0
+    cutoff = datetime.now() - timedelta(days=d)
+    removed = 0
+    for filename in list(os.listdir(TASKS_DIR)):
+        if not filename.endswith(".json"):
+            continue
+        task_file = os.path.join(TASKS_DIR, filename)
+        try:
+            with open(task_file, "r", encoding="utf-8") as f:
+                task_data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        created = _parse_task_created_at(task_data)
+        if created is None or created >= cutoff:
+            continue
+        uid = task_data.get("user_id")
+        tid = task_data.get("task_id")
+        if not uid or not tid:
+            continue
+        _delete_task(uid, tid)
+        removed += 1
+    if removed:
+        print(f"[任务] 已自动清除超过 {d} 天的任务: {removed} 个")
+    return removed
+
+
+def _task_stats(tasks: List[Dict]) -> Dict[str, int]:
+    s = {"completed": 0, "processing": 0, "pending": 0, "failed": 0}
+    for t in tasks:
+        st = t.get("status")
+        if st in s:
+            s[st] += 1
+    return s
 
 
 def _queue_worker():
@@ -523,6 +604,162 @@ def _clean_b64(raw: str) -> str:
     return re.sub(r'[^A-Za-z0-9+/=]', '', raw)
 
 
+def _is_riff_wave(audio_bytes: bytes) -> bool:
+    return len(audio_bytes) >= 12 and audio_bytes[:4] == b"RIFF" and audio_bytes[8:12] == b"WAVE"
+
+
+def _ref_audio_ok_for_model(path: str) -> bool:
+    """
+    参考音频可直接交给模型：soundfile 能读且采样率为 16kHz（常见为 WAV 16kHz）。
+    不满足时再走 ffmpeg 转单声道 16kHz WAV。
+    """
+    try:
+        info = sf.info(path)
+        return int(info.samplerate) == REF_AUDIO_TARGET_SR
+    except Exception:
+        return False
+
+
+def _guess_ref_audio_suffix(
+    params: Dict,
+    audio_bytes: bytes,
+    data_uri_suffix: Optional[str] = None,
+) -> str:
+    """为参考音频二进制选择临时文件扩展名（浏览器常为 webm/ogg，误用 .wav 会导致 librosa 加载失败）。"""
+    if data_uri_suffix:
+        return data_uri_suffix
+
+    ct = (params.get("ref_audio_content_type") or "").lower()
+    fn = (params.get("ref_audio_filename") or "").lower()
+
+    if "webm" in ct or "matroska" in ct:
+        return ".webm"
+    if "ogg" in ct and "video" not in ct:
+        return ".ogg"
+    if "mpeg" in ct or "/mp3" in ct or ct == "audio/mp3":
+        return ".mp3"
+    if "mp4" in ct or "m4a" in ct or "aac" in ct:
+        return ".m4a"
+    if "flac" in ct:
+        return ".flac"
+    if "wav" in ct or "wave" in ct or ct.endswith("audio/x-wav"):
+        return ".wav"
+
+    for ext in (".webm", ".weba"):
+        if fn.endswith(ext):
+            return ".webm"
+    if fn.endswith(".opus"):
+        return ".ogg"
+    for ext in (".ogg", ".oga"):
+        if fn.endswith(ext):
+            return ".ogg"
+    if fn.endswith(".mp3"):
+        return ".mp3"
+    if fn.endswith((".m4a", ".mp4", ".aac")):
+        return ".m4a"
+    if fn.endswith(".flac"):
+        return ".flac"
+    if fn.endswith(".wav"):
+        return ".wav"
+
+    if len(audio_bytes) < 16:
+        return ".wav"
+
+    if _is_riff_wave(audio_bytes):
+        return ".wav"
+    if audio_bytes[:4] == b"\x1aE\xdf\xa3":
+        return ".webm"
+    if audio_bytes[:4] == b"OggS":
+        return ".ogg"
+    if audio_bytes[:3] == b"ID3" or (audio_bytes[0] == 0xFF and len(audio_bytes) > 1 and (audio_bytes[1] & 0xE0) == 0xE0):
+        return ".mp3"
+    if audio_bytes[4:8] == b"ftyp":
+        return ".m4a"
+    if audio_bytes[:4] == b"fLaC":
+        return ".flac"
+
+    # 常见：浏览器录音为 WebM，无可靠文件名时按 webm 处理
+    return ".webm"
+
+
+def _write_ref_audio_temp_for_clone(
+    params: Dict,
+    audio_bytes: bytes,
+    data_uri_suffix: Optional[str] = None,
+) -> str:
+    """
+    将参考音频写入临时文件；若已是 16kHz（可直接读）则不改；否则用 ffmpeg 转单声道 16kHz WAV。
+    """
+    suffix = _guess_ref_audio_suffix(params, audio_bytes, data_uri_suffix)
+    tf = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    tf.write(audio_bytes)
+    tf.close()
+    raw_path = tf.name
+
+    if _ref_audio_ok_for_model(raw_path):
+        return raw_path
+
+    ff = shutil.which("ffmpeg")
+    if ff:
+        out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        out.close()
+        wav_path = out.name
+        try:
+            cmd = [
+                ff, "-y", "-loglevel", "error", "-i", raw_path,
+                "-ac", "1", "-ar", str(REF_AUDIO_TARGET_SR), "-f", "wav", wav_path,
+            ]
+            run_kw: Dict[str, Any] = {"check": True, "timeout": 120}
+            if os.name == "nt":
+                run_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.run(cmd, **run_kw)
+            try:
+                os.remove(raw_path)
+            except OSError:
+                pass
+            return wav_path
+        except Exception:
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+            return raw_path
+    return raw_path
+
+
+def _ensure_ref_audio_path_for_model(stored_path: str) -> Tuple[str, bool]:
+    """
+    已落盘的参考音频 → 交给 Qwen 的路径。
+    直接保存的文件若已是 16kHz（soundfile 可读）则原样使用；否则 ffmpeg 转单声道 16kHz WAV。
+    返回 (路径, 是否需在调用方 finally 中删除该临时文件)。
+    """
+    if _ref_audio_ok_for_model(stored_path):
+        return stored_path, False
+
+    ff = shutil.which("ffmpeg")
+    if ff:
+        out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        out.close()
+        wav_path = out.name
+        try:
+            cmd = [
+                ff, "-y", "-loglevel", "error", "-i", stored_path,
+                "-ac", "1", "-ar", str(REF_AUDIO_TARGET_SR), "-f", "wav", wav_path,
+            ]
+            run_kw: Dict[str, Any] = {"check": True, "timeout": 120}
+            if os.name == "nt":
+                run_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.run(cmd, **run_kw)
+            return wav_path, True
+        except Exception:
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+    # 无 ffmpeg 或转换失败：使用原文件（扩展名已在落盘时按类型选对）
+    return stored_path, False
+
+
 def _get_audio_duration_seconds(path_or_b64: str) -> float:
     """
     获取音频时长（秒）。
@@ -579,20 +816,59 @@ def _normalize_text_for_tts(text: str) -> str:
     return text.strip()
 
 
-_TRAILING_PUNCT_RE = re.compile(r'[。！？!?；;，,、：:…]+$')
-
-
 def _ensure_trailing_guard(text: str) -> str:
-    """
-    在文本末尾追加一个"牺牲句号"，迫使模型多生成一小段音频，
-    避免最后一个真实字被截断。如果文本已经以强标点结尾，则不重复添加。
-    """
+    """在每个片段末尾追加 '…嗯~' 防止模型吃掉最后一个字（社区方案）。"""
     text = text.rstrip()
     if not text:
         return text
-    if _TRAILING_PUNCT_RE.search(text):
-        return text + "。"
-    return text + "。"
+    return text + "…嗯~"
+
+
+def _trim_trailing_guard(wav: np.ndarray, sr: int, search_sec: float = 2.0) -> np.ndarray:
+    """裁掉末尾 '…嗯~' 产生的牺牲音频。
+    从音频末尾反向检测：跳过尾部静音 → 跳过'嗯'语音 → 找到'…'的静音间隙 → 在此处切断。
+    """
+    min_samples = int(sr * 0.5)
+    if len(wav) < min_samples:
+        return wav
+
+    frame_len = int(sr * 0.02)
+    hop = frame_len // 2
+    search_samples = min(int(sr * search_sec), len(wav))
+    tail = wav[-search_samples:]
+
+    n_frames = max(1, (len(tail) - frame_len) // hop + 1)
+    rms = np.array([
+        np.sqrt(np.mean(tail[i * hop:i * hop + frame_len] ** 2))
+        for i in range(n_frames)
+    ])
+
+    threshold = max(np.median(rms) * 0.12, np.max(rms) * 0.03)
+    is_voice = rms > threshold
+
+    i = n_frames - 1
+    while i >= 0 and not is_voice[i]:
+        i -= 1
+    en_voice_end = i
+
+    while i >= 0 and is_voice[i]:
+        i -= 1
+    en_silence_end = i
+
+    if en_silence_end <= 0 or en_voice_end <= en_silence_end:
+        return wav
+
+    cut_frame = en_silence_end
+    cut_sample = len(wav) - search_samples + cut_frame * hop
+
+    if cut_sample < len(wav) // 2:
+        return wav
+
+    fade_len = min(int(sr * 0.03), cut_sample)
+    fade = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+    result = wav[:cut_sample].copy()
+    result[-fade_len:] *= fade
+    return result
 
 
 def _apply_polyphonic(text: str) -> str:
@@ -674,6 +950,12 @@ def _startup_preload_models():
 
     # 3. 启动任务队列工作线程
     _start_queue_worker()
+
+    # 4. 清除超过保留期的任务
+    try:
+        _purge_tasks_older_than_days()
+    except Exception as e:
+        print(f"[WARN] 过期任务清理失败: {e}")
 
 
 @asynccontextmanager
@@ -790,7 +1072,7 @@ async def recognize_audio(file: UploadFile = File(...)):
 
 def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
     """后台处理语音克隆任务"""
-    ref_audio_tmp = None
+    cleanup_ref_path = None  # 仅删除临时转码的 wav，不删 tasks/ref_audio 下已保存文件
     try:
         # 更新任务状态为处理中
         task_data = _get_task(user_id, task_id)
@@ -808,28 +1090,49 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         text = _ensure_trailing_guard(_apply_polyphonic(params["text"]))
         ref_text = _apply_polyphonic(params["ref_text"])
         
-        # 将base64转为临时文件
-        ref_audio_b64 = params["ref_audio_b64"].strip()
-        if "," in ref_audio_b64:
-            ref_audio_b64 = ref_audio_b64.split(",", 1)[1]
-        ref_audio_b64 = re.sub(r'[^A-Za-z0-9+/=]', '', ref_audio_b64)
-        audio_bytes = base64.b64decode(ref_audio_b64)
-        ref_audio_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        ref_audio_tmp.write(audio_bytes)
-        ref_audio_tmp.close()
-        
+        # 参考音频：优先使用提交时已保存的本地文件（避免排队后 base64 再解码丢格式）
+        rel = params.get("ref_audio_rel")
+        if rel and isinstance(rel, str):
+            stored_path = os.path.join(TASKS_DIR, rel.replace("/", os.sep))
+            if not os.path.isfile(stored_path):
+                raise FileNotFoundError(f"参考音频不存在或已删除: {rel}")
+            model_ref_path, is_temp = _ensure_ref_audio_path_for_model(stored_path)
+            if is_temp:
+                cleanup_ref_path = model_ref_path
+        else:
+            # 兼容旧任务：仅有 base64
+            ref_audio_b64 = (params.get("ref_audio_b64") or "").strip()
+            if not ref_audio_b64:
+                raise ValueError("任务缺少参考音频（ref_audio_rel 或 ref_audio_b64）")
+            data_uri_suffix = None
+            if "," in ref_audio_b64:
+                header = ref_audio_b64.split(",", 1)[0].lower()
+                ref_audio_b64 = ref_audio_b64.split(",", 1)[1]
+                for mime, ext in [("webm", ".webm"), ("ogg", ".ogg"), ("mp3", ".mp3"),
+                                  ("mpeg", ".mp3"), ("mp4", ".m4a"), ("flac", ".flac")]:
+                    if mime in header:
+                        data_uri_suffix = ext
+                        break
+            ref_audio_b64 = re.sub(r"[^A-Za-z0-9+/=]", "", ref_audio_b64)
+            audio_bytes = base64.b64decode(ref_audio_b64)
+            model_ref_path = _write_ref_audio_temp_for_clone(
+                params, audio_bytes, data_uri_suffix=data_uri_suffix
+            )
+            cleanup_ref_path = model_ref_path
+
         # 生成语音
         print(f"[任务 {task_id}] 生成语音中...")
         wavs, sr = model.generate_voice_clone(
             text=text,
             language=params["lang"],
-            ref_audio=ref_audio_tmp.name,
+            ref_audio=model_ref_path,
             ref_text=ref_text,
             x_vector_only_mode=False,
         )
         
-        # 应用语速调整
-        wav_out = _apply_speed(wavs[0], params["speed"], sr)
+        # 裁掉末尾牺牲音频（…嗯~），再应用语速调整
+        wav_raw = _trim_trailing_guard(np.asarray(wavs[0], dtype=np.float32), sr)
+        wav_out = _apply_speed(wav_raw, params["speed"], sr)
         
         # 保存音频文件
         audio_filename = f"{user_id}_{task_id}.wav"
@@ -874,21 +1177,22 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         print(f"[OK] 任务 {task_id} 完成 (时长: {len(wav_out)/sr:.1f}s)")
         
     except Exception as e:
-        # 更新任务状态为失败
+        import traceback
+        traceback.print_exc()
+        err_msg = str(e) or repr(e)
         task_data = _get_task(user_id, task_id)
         if task_data:
             task_data["status"] = "failed"
-            task_data["error"] = str(e)
+            task_data["error"] = err_msg
             task_data["failed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             _save_task(user_id, task_id, task_data)
-        print(f"[FAIL] 任务 {task_id} 失败: {str(e)}")
+        print(f"[FAIL] 任务 {task_id} 失败: {err_msg}")
     
     finally:
-        # 清理临时文件
-        if ref_audio_tmp and os.path.exists(ref_audio_tmp.name):
+        if cleanup_ref_path and os.path.exists(cleanup_ref_path):
             try:
-                os.unlink(ref_audio_tmp.name)
-            except:
+                os.unlink(cleanup_ref_path)
+            except OSError:
                 pass
 
 
@@ -923,9 +1227,10 @@ def voice_clone_sync(req: VoiceCloneRequest):
             x_vector_only_mode=req.x_vector_only_mode,
         )
         
-        # 应用语速调整
+        # 裁掉末尾牺牲音频（…嗯~），再应用语速调整
+        wav_raw = _trim_trailing_guard(np.asarray(wavs[0], dtype=np.float32), sr)
         wav_out = _apply_speed(
-            wavs[0],
+            wav_raw,
             req.speed if req.speed_enabled else 1.0,
             sr,
         )
@@ -987,31 +1292,44 @@ async def submit_voice_clone_task_upload(
         if model not in ("0.6B", "1.7B"):
             raise ValueError(f"不支持的模型: {model}，请使用 0.6B 或 1.7B")
         
-        # 读取上传的音频文件
+        # 读取上传的音频并立即落盘（队列处理时直接读文件，避免 base64 再解码导致格式/扩展名错误）
         audio_content = await ref_audio.read()
-        
-        # 转换为base64
-        ref_audio_b64 = base64.b64encode(audio_content).decode('utf-8')
-        
-        # 验证参考音频时长（3-15 秒）
-        try:
-            duration = _get_audio_duration_seconds(ref_audio_b64)
-            _validate_ref_audio_duration(duration)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        
-        # 生成任务ID
+        if not audio_content:
+            raise HTTPException(status_code=400, detail="参考音频文件为空")
+
         task_id_final = task_id or _generate_task_id()
-        
-        # 检查任务是否已存在
         existing_task = _get_task(user_id, task_id_final)
         if existing_task:
             raise HTTPException(
-                status_code=400, 
-                detail=f"任务ID已存在: {task_id_final}"
+                status_code=400,
+                detail=f"任务ID已存在: {task_id_final}",
             )
-        
-        # 创建任务记录
+
+        meta = {
+            "ref_audio_filename": ref_audio.filename or "",
+            "ref_audio_content_type": ref_audio.content_type or "",
+        }
+        suffix = _guess_ref_audio_suffix(meta, audio_content, None)
+        ref_basename = f"{user_id}_{task_id_final}{suffix}"
+        ref_abs_path = os.path.join(REF_AUDIO_DIR, ref_basename)
+        ref_rel = f"ref_audio/{ref_basename}"
+        try:
+            with open(ref_abs_path, "wb") as out_f:
+                out_f.write(audio_content)
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"无法保存参考音频: {e}") from e
+
+        try:
+            duration = _get_audio_duration_seconds(ref_abs_path)
+            _validate_ref_audio_duration(duration)
+        except ValueError as e:
+            try:
+                os.remove(ref_abs_path)
+            except OSError:
+                pass
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        # 创建任务记录（不再存 ref_audio_b64，减小 JSON 与内存占用）
         task_data = {
             "task_id": task_id_final,
             "user_id": user_id,
@@ -1019,12 +1337,14 @@ async def submit_voice_clone_task_upload(
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "params": {
                 "text": text,
-                "ref_audio_b64": ref_audio_b64,
+                "ref_audio_rel": ref_rel,
+                "ref_audio_filename": meta["ref_audio_filename"],
+                "ref_audio_content_type": meta["ref_audio_content_type"],
                 "ref_text": ref_text,
                 "speed": float(speed),
                 "lang": lang,
                 "model": model,
-            }
+            },
         }
         
         # 保存任务
@@ -1100,19 +1420,30 @@ def get_task_status(user_id: str, task_id: str, request: Request):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.get("/api/tasks/{user_id}", tags=["任务管理"], summary="查询用户所有任务")
-def list_user_tasks(user_id: str, request: Request):
+@app.get("/api/tasks/{user_id}", tags=["任务管理"], summary="查询用户任务（分页）")
+def list_user_tasks(
+    user_id: str,
+    request: Request,
+    page: int = Query(1, ge=1, description="页码，从 1 开始"),
+    page_size: int = Query(10, ge=1, le=100, description="每页条数，最大 100"),
+):
     """
-    查询用户的所有任务
-    
-    返回任务列表，按创建时间倒序
+    查询用户的任务列表，按创建时间倒序；支持分页。
+    每次调用会先清理全局过期任务：创建超过保留期的任务一律删除（含仍为 processing 的僵死任务）。
     """
     try:
+        _purge_tasks_older_than_days()
         tasks = _get_user_tasks(user_id)
+        total = len(tasks)
+        stats = _task_stats(tasks)
+        total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+        if page > total_pages and total_pages >= 1:
+            page = total_pages
+        start = (page - 1) * page_size
+        page_tasks = tasks[start : start + page_size]
+
         base_url = _base_url(request)
-        
-        # 处理每个任务的 audio_url
-        for task in tasks:
+        for task in page_tasks:
             if "params" in task and "ref_audio_b64" in task["params"]:
                 task["params"]["ref_audio_b64"] = "[已隐藏]"
             if task.get("audio_url") and not task["audio_url"].startswith("http"):
@@ -1121,11 +1452,16 @@ def list_user_tasks(user_id: str, request: Request):
                 task["subtitle_srt"] = base_url + task["subtitle_srt"]
             if task.get("subtitle_json") and not task["subtitle_json"].startswith("http"):
                 task["subtitle_json"] = base_url + task["subtitle_json"]
-        
+
         return {
             "user_id": user_id,
-            "total": len(tasks),
-            "tasks": tasks
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+            "retention_days": TASK_RETENTION_DAYS,
+            "stats": stats,
+            "tasks": page_tasks,
         }
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1139,6 +1475,78 @@ def delete_task(user_id: str, task_id: str):
         if not success:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"message": "任务已删除", "task_id": task_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/task/{user_id}/{task_id}/retry", tags=["任务管理"], summary="重试任务")
+def retry_task(user_id: str, task_id: str):
+    """使用原任务参数重新排队；参考音频从本地文件复制或从旧版 base64 落盘。"""
+    try:
+        task = _get_task(user_id, task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        old_params = task.get("params")
+        if not old_params:
+            raise HTTPException(status_code=400, detail="无法重试：缺少任务参数")
+
+        params = copy.deepcopy(old_params)
+        new_task_id = _generate_task_id()
+        rel = params.get("ref_audio_rel")
+        b64 = params.get("ref_audio_b64")
+
+        if rel and isinstance(rel, str):
+            src = os.path.join(TASKS_DIR, rel.replace("/", os.sep))
+            if not os.path.isfile(src):
+                raise HTTPException(status_code=400, detail="参考音频文件已丢失，无法重试")
+            ext = os.path.splitext(rel)[1] or ".webm"
+            new_rel = f"ref_audio/{user_id}_{new_task_id}{ext}"
+            dst = os.path.join(TASKS_DIR, new_rel.replace("/", os.sep))
+            try:
+                shutil.copy2(src, dst)
+            except OSError as e:
+                raise HTTPException(status_code=500, detail=f"复制参考音频失败: {e}") from e
+            params["ref_audio_rel"] = new_rel
+            params.pop("ref_audio_b64", None)
+        elif b64 and isinstance(b64, str) and b64.strip() and b64 != "[已隐藏]":
+            meta = {
+                "ref_audio_filename": params.get("ref_audio_filename") or "",
+                "ref_audio_content_type": params.get("ref_audio_content_type") or "",
+            }
+            raw = b64.strip()
+            if "," in raw:
+                raw = raw.split(",", 1)[1]
+            raw = re.sub(r"[^A-Za-z0-9+/=]", "", raw)
+            audio_bytes = base64.b64decode(raw)
+            suffix = _guess_ref_audio_suffix(meta, audio_bytes, None)
+            new_rel = f"ref_audio/{user_id}_{new_task_id}{suffix}"
+            dst = os.path.join(TASKS_DIR, new_rel.replace("/", os.sep))
+            with open(dst, "wb") as f:
+                f.write(audio_bytes)
+            params["ref_audio_rel"] = new_rel
+            params.pop("ref_audio_b64", None)
+        else:
+            raise HTTPException(status_code=400, detail="无法重试：缺少参考音频文件或数据")
+
+        task_data = {
+            "task_id": new_task_id,
+            "user_id": user_id,
+            "status": "pending",
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "params": params,
+        }
+        _save_task(user_id, new_task_id, task_data)
+        _TASK_QUEUE.put({"user_id": user_id, "task_id": new_task_id, "params": params})
+        _start_queue_worker()
+        return {
+            "ok": True,
+            "task_id": new_task_id,
+            "user_id": user_id,
+            "status": "pending",
+            "message": "已重新加入队列",
+        }
     except HTTPException:
         raise
     except Exception as exc:

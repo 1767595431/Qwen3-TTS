@@ -132,7 +132,7 @@ python api_server.py --port 8001
 | `/api/clone/upload` | POST | 提交语音克隆任务（文件上传） |
 | `/api/voice-clone` | POST | 同步语音克隆 |
 | `/api/task/{user_id}/{task_id}` | GET | 查询任务状态 |
-| `/api/tasks/{user_id}` | GET | 查询用户所有任务 |
+| `/api/tasks/{user_id}` | GET | 查询用户任务（分页；超保留期自动清理，含僵死 processing） |
 | `/api/task/{user_id}/{task_id}` | DELETE | 删除任务 |
 | `/api/download/{user_id}/{task_id}` | GET | 下载生成的音频 |
 | `/api/queue/status` | GET | 查询队列状态 |
