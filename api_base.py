@@ -21,6 +21,42 @@ from queue import Queue
 
 import requests as http_requests
 
+# ----------------------------
+# GPU 选择（必须在 import torch 前生效）
+# 用法：
+#   - 环境变量：QWEN_TTS_GPU=1  或 CUDA_VISIBLE_DEVICES=1
+#   - 命令行：python api_base.py --gpu 1 --port 9770
+# 说明：
+#   - 设置 CUDA_VISIBLE_DEVICES 后，程序内看到的第一张卡会变成 cuda:0
+#   - 例如 --gpu 1 表示只暴露物理第 2 张卡给本进程
+# ----------------------------
+def _preparse_gpu_from_argv(argv: List[str]) -> Optional[str]:
+    try:
+        i = argv.index("--gpu")
+    except ValueError:
+        return None
+    if i + 1 >= len(argv):
+        return ""
+    return str(argv[i + 1]).strip()
+
+
+def _apply_cuda_visible_devices() -> None:
+    # 若用户已显式设置 CUDA_VISIBLE_DEVICES，则不覆盖
+    if os.getenv("CUDA_VISIBLE_DEVICES", "").strip():
+        return
+    gpu = os.getenv("QWEN_TTS_GPU", "").strip()
+    if not gpu:
+        gpu = _preparse_gpu_from_argv(sys.argv)
+    if gpu is None:
+        return
+    if gpu == "":
+        # 提供了 --gpu 但没给值：不做任何事，后续 argparse 会报错/用户可看到
+        return
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+
+
+_apply_cuda_visible_devices()
+
 # 屏蔽 pyannote/torchcodec 的 torchcodec 加载失败警告（不影响 WhisperX 功能）
 warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
 warnings.filterwarnings("ignore", category=UserWarning, module="torchcodec")
@@ -1632,16 +1668,23 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Qwen3-TTS 语音克隆服务")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址（默认: 0.0.0.0）")
     parser.add_argument("--port", type=int, default=9778, help="监听端口（默认: 9770）")
+    parser.add_argument("--gpu", type=str, default=os.getenv("QWEN_TTS_GPU", "").strip(),
+                        help="使用第几张显卡（写入 CUDA_VISIBLE_DEVICES）。例如 --gpu 1；留空则不设置")
     args = parser.parse_args()
     
     HOST = args.host
     PORT = args.port
+    if args.gpu:
+        # 此处仅用于打印/与 bat 对齐；真正生效需在 import torch 前设置（文件顶部已做预解析）
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu).strip()
     
     # 启动前打印服务信息
     print("="*60)
     print("[OK] 服务启动完成！")
     print(f"[INFO] WhisperX 模型目录: models/WhisperX")
     print(f"[INFO] 监听地址: http://{HOST}:{PORT}")
+    if os.getenv("CUDA_VISIBLE_DEVICES", "").strip():
+        print(f"[INFO] CUDA_VISIBLE_DEVICES: {os.getenv('CUDA_VISIBLE_DEVICES')}")
     print("="*60 + "\n")
     
     uvicorn.run(app, host=HOST, port=PORT)
