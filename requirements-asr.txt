@@ -1,4 +1,0 @@
-# SenseVoice 语音识别（参考音频自动识别文本）
-# 可选安装：pip install -r requirements-asr.txt
-funasr>=1.0.0
-modelscope>=1.9.0

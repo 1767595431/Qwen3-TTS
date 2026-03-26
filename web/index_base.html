@@ -888,7 +888,7 @@
       });
 
       document.getElementById("clearAllTasks").addEventListener("click", async () => {
-        if (!confirm("确认清除所有任务？正在执行中的任务不会被删除。")) return;
+        if (!confirm("确认清除所有任务？默认会保留 processing 任务（可在后端用 include_processing=true 强制清除）。")) return;
         const btn = document.getElementById("clearAllTasks");
         btn.disabled = true;
         btn.textContent = "清除中...";
@@ -998,8 +998,10 @@
               if (srtLink) actions += `<a href="${srtLink}" class="icon-btn" download>SRT</a> `;
               if (jsonLink) actions += `<a href="${jsonLink}" class="icon-btn" download>JSON</a> `;
             }
+            // 允许删除任意状态（含 processing：用于清理上次中断的“僵尸任务”）
+            actions += `<button type="button" class="icon-btn" onclick="deleteTaskThenRefresh('${task.user_id}','${task.task_id}','tasksModal')">删除</button> `;
             if (task.status === 'failed' || task.status === 'completed') {
-              actions += `<button type="button" class="icon-btn" onclick="deleteTaskThenRefresh('${task.user_id}','${task.task_id}','tasksModal')">删除</button> <button type="button" class="icon-btn" onclick="retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button>`;
+              actions += `<button type="button" class="icon-btn" onclick="retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button>`;
             }
             if (!actions) actions = '<span style="color:var(--muted);font-size:11px;">-</span>';
             html += `<tr><td><code style="font-size:11px;">${task.task_id}</code></td><td><span style="color:${statusColor};">${task.status}</span></td><td style="font-size:12px;">${new Date(task.created_at).toLocaleString()}</td><td style="white-space:nowrap;">${actions}</td></tr>`;
@@ -1127,9 +1129,12 @@
               if (srtLink) actions += `<a href="${srtLink}" class="icon-btn" download onclick="event.stopPropagation();">SRT</a> `;
               if (jsonLink) actions += `<a href="${jsonLink}" class="icon-btn" download onclick="event.stopPropagation();">JSON</a> `;
             }
-            else if (task.status === 'processing' || task.status === 'pending') actions = '<span style="color:var(--muted);font-size:11px;">处理中</span>';
+            // 允许删除任意状态（含 processing：用于清理上次中断的“僵尸任务”）
+            actions += `<button type="button" class="icon-btn" onclick="event.stopPropagation(); deleteTaskThenRefresh('${userId}','${task.task_id}','pageTasks')">删除</button> `;
             if (task.status === 'failed' || task.status === 'completed') {
-              actions += `<button type="button" class="icon-btn" onclick="event.stopPropagation(); deleteTaskThenRefresh('${userId}','${task.task_id}','pageTasks')">删除</button> <button type="button" class="icon-btn" onclick="event.stopPropagation(); retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button>`;
+              actions += `<button type="button" class="icon-btn" onclick="event.stopPropagation(); retryTaskThenRefresh('${task.user_id}','${task.task_id}')">重试</button>`;
+            } else if (task.status === 'processing' || task.status === 'pending') {
+              actions += `<span style="color:var(--muted);font-size:11px; margin-left:6px;">处理中</span>`;
             }
             if (!actions) actions = '<span style="color:var(--muted);font-size:11px;">-</span>';
             html += `<tr style="cursor:pointer;" onclick="showTaskDetail('${userId}', '${task.task_id}')"><td><code style="font-size:11px;">${task.task_id}</code></td><td><span style="color:${statusColor};font-weight:600;font-size:12px;">${statusText}</span></td><td style="font-size:12px;">${shortText}</td><td style="font-size:11px;color:var(--muted);">${new Date(task.created_at).toLocaleString()}</td><td style="white-space:nowrap;">${actions}</td></tr>`;

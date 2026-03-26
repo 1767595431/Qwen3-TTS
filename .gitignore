@@ -31,11 +31,6 @@ models/
 *.onnx
 *.tar
 
-# SenseVoice ASR model & cache
-SenseVoiceSmall/model.pt
-SenseVoiceSmall/cache/
-SenseVoiceSmall/*.model
-
 # Runtime generated audio & task data
 tasks/audio/
 tasks/*.json

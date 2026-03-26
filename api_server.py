@@ -60,7 +60,16 @@ def _resolve_model_path(model_type: str, model_size: str) -> str:
 
 def _default_device_and_dtype() -> Tuple[str, torch.dtype]:
     if torch.cuda.is_available():
-        return "cuda:0", torch.bfloat16
+        if os.getenv("QWEN_TTS_FORCE_FP32", "").strip().lower() in ("1", "true", "yes"):
+            return "cuda:0", torch.float32
+        # 2080Ti(Turing, SM75) 不支持 bfloat16；强制 bfloat16 可能导致异常/极慢退化
+        try:
+            major, _minor = torch.cuda.get_device_capability(0)
+        except Exception:
+            major = 0
+        # 稳定优先：SM80+ 用 bf16；更老架构默认用 fp32（仍在 GPU 上）以避免 fp16 数值不稳导致的概率 NaN/Inf。
+        dtype = torch.bfloat16 if major >= 8 else torch.float32
+        return "cuda:0", dtype
     return "cpu", torch.float32
 
 
@@ -207,6 +216,66 @@ def _get_model(model_type: str, model_size: str) -> Qwen3TTSModel:
     key = (model_type, model_size)
     if key in _MODEL_CACHE:
         return _MODEL_CACHE[key]
+
+
+def _is_prob_tensor_assert_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "probability tensor contains either" in msg
+        or "device-side assert triggered" in msg
+        or "cuda error: device-side assert triggered" in msg
+    )
+
+
+def _load_model_with_dtype(model_type: str, model_size: str, dtype: torch.dtype) -> Qwen3TTSModel:
+    model_path = _resolve_model_path(model_type, model_size)
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    return Qwen3TTSModel.from_pretrained(
+        model_path,
+        device_map=device,
+        dtype=dtype,
+        attn_implementation="eager",
+    )
+
+
+def _generate_voice_clone_with_fallback(
+    model_type: str,
+    model_size: str,
+    text: str,
+    language: str,
+    ref_audio: str,
+    ref_text: str,
+    x_vector_only_mode: bool,
+):
+    model = _get_model(model_type, model_size)
+    try:
+        return model.generate_voice_clone(
+            text=text,
+            language=language,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            x_vector_only_mode=x_vector_only_mode,
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        if torch.cuda.is_available() and _is_prob_tensor_assert_error(e):
+            if "device-side assert triggered" in msg:
+                raise RuntimeError(
+                    "CUDA device-side assert triggered. "
+                    "该错误会污染当前进程的 CUDA 上下文，无法在同一进程内恢复。"
+                    "请重启服务进程后重试；建议设置 QWEN_TTS_FORCE_FP32=1 以提高稳定性（仍在 GPU 上运行）。"
+                ) from e
+
+            print("[WARN] CUDA 采样概率异常，尝试使用 GPU(float32) 重新生成一次（更稳定但更慢）")
+            model_fp32 = _load_model_with_dtype(model_type, model_size, torch.float32)
+            return model_fp32.generate_voice_clone(
+                text=text,
+                language=language,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                x_vector_only_mode=x_vector_only_mode,
+            )
+        raise
 
     model_path = _resolve_model_path(model_type, model_size)
     device, dtype = _default_device_and_dtype()
@@ -624,10 +693,11 @@ def voice_clone(req: VoiceCloneRequest):
             _validate_ref_audio_duration(duration)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        model = _get_model("base", req.model_size)
         text = _apply_polyphonic(req.text)
         ref_text = _apply_polyphonic(req.ref_text)
-        wavs, sr = model.generate_voice_clone(
+        wavs, sr = _generate_voice_clone_with_fallback(
+            model_type="base",
+            model_size=req.model_size,
             text=text,
             language=req.language,
             ref_audio=req.ref_audio_b64,
@@ -673,14 +743,14 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         _save_task(user_id, task_id, task_data)
         
         # 加载模型
-        model = _get_model("base", params["model"])
-        
         # 处理文本（移除拼音标注）
         text = _apply_polyphonic(params["text"])
         ref_text = _apply_polyphonic(params["ref_text"])
         
         # 生成语音
-        wavs, sr = model.generate_voice_clone(
+        wavs, sr = _generate_voice_clone_with_fallback(
+            model_type="base",
+            model_size=params["model"],
             text=text,
             language=params["lang"],
             ref_audio=params["ref_audio_b64"],
@@ -921,29 +991,53 @@ def delete_task(user_id: str, task_id: str):
 @app.post("/api/task/{user_id}/{task_id}/retry")
 def retry_task(user_id: str, task_id: str):
     """
-    使用原任务参数重新提交（生成新任务ID，加入队列）。
-    返回新任务的 task_id 与 status。
+    使用原任务参数重新提交（复用原 task_id，加入队列）。
+    返回 task_id 与 status。
     """
     try:
         task = _get_task(user_id, task_id)
         if not task:
             raise HTTPException(status_code=404, detail="任务不存在")
+        if task.get("status") == "processing":
+            raise HTTPException(status_code=400, detail="任务正在处理中，无法重试")
         params = task.get("params")
         if not params or "ref_audio_b64" not in params or params.get("ref_audio_b64") == "[已隐藏]":
             raise HTTPException(status_code=400, detail="无法重试：缺少参考音频数据")
-        new_task_id = _generate_task_id()
-        new_task_data = {
-            "task_id": new_task_id,
-            "user_id": user_id,
-            "status": "pending",
-            "created_at": datetime.now().isoformat(),
-            "params": params,
-        }
-        _save_task(user_id, new_task_id, new_task_data)
-        _TASK_QUEUE.put({"user_id": user_id, "task_id": new_task_id, "params": params})
+
+        # 清理旧输出文件（若存在）
+        if task.get("audio_file"):
+            audio_path = os.path.join(AUDIO_OUTPUT_DIR, task["audio_file"])
+            srt_path, json_path = _subtitle_paths_for_audio(audio_path)
+            for p in (audio_path, srt_path, json_path):
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+
+        task["status"] = "pending"
+        task["retry_count"] = int(task.get("retry_count") or 0) + 1
+        task["retried_at"] = datetime.now().isoformat()
+        for k in (
+            "started_at",
+            "completed_at",
+            "failed_at",
+            "error",
+            "audio_url",
+            "audio_file",
+            "sample_rate",
+            "subtitle_srt",
+            "subtitle_json",
+            "subtitle_error",
+            "subtitle_generated_at",
+            "subtitle_elapsed_sec",
+        ):
+            task.pop(k, None)
+        _save_task(user_id, task_id, task)
+        _TASK_QUEUE.put({"user_id": user_id, "task_id": task_id, "params": params})
         return {
             "ok": True,
-            "task_id": new_task_id,
+            "task_id": task_id,
             "user_id": user_id,
             "status": "pending",
             "message": "已重新加入队列",

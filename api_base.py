@@ -117,7 +117,16 @@ def _resolve_model_path(model_size: str) -> str:
 
 def _default_device_and_dtype() -> Tuple[str, torch.dtype]:
     if torch.cuda.is_available():
-        return "cuda:0", torch.bfloat16
+        if os.getenv("QWEN_TTS_FORCE_FP32", "").strip().lower() in ("1", "true", "yes"):
+            return "cuda:0", torch.float32
+        # 2080Ti(Turing, SM75) 不支持 bfloat16；强制 bfloat16 可能导致异常/极慢退化
+        try:
+            major, _minor = torch.cuda.get_device_capability(0)
+        except Exception:
+            major = 0
+        # 稳定优先：SM80+ 用 bf16；更老架构默认用 fp32（仍在 GPU 上）以避免 fp16 数值不稳导致的概率 NaN/Inf。
+        dtype = torch.bfloat16 if major >= 8 else torch.float32
+        return "cuda:0", dtype
     return "cpu", torch.float32
 
 
@@ -189,6 +198,15 @@ def _delete_ref_audio_file_if_any(params: Optional[Dict]) -> None:
 
 def _delete_task(user_id: str, task_id: str) -> bool:
     """删除任务：从内存和文件移除，并删除输出音频与参考音频文件。返回是否成功。"""
+    # 判定是否真实存在（避免删除不存在的任务也返回成功）
+    key = _get_task_key(user_id, task_id)
+    task_file = os.path.join(TASKS_DIR, f"{user_id}_{task_id}.json")
+    exists = False
+    with _TASKS_LOCK:
+        exists = key in _TASKS_STORE
+    if not exists and not os.path.exists(task_file):
+        return False
+
     task_data = _get_task(user_id, task_id)
     if task_data:
         _delete_ref_audio_file_if_any(task_data.get("params"))
@@ -202,10 +220,8 @@ def _delete_task(user_id: str, task_id: str) -> bool:
                 except OSError:
                     pass
     with _TASKS_LOCK:
-        key = _get_task_key(user_id, task_id)
         if key in _TASKS_STORE:
             del _TASKS_STORE[key]
-    task_file = os.path.join(TASKS_DIR, f"{user_id}_{task_id}.json")
     if os.path.exists(task_file):
         try:
             os.remove(task_file)
@@ -397,6 +413,72 @@ def _get_model(model_size: str) -> Qwen3TTSModel:
         )
         _MODEL_CACHE[model_size] = model
     return _MODEL_CACHE[model_size]
+
+
+def _is_prob_tensor_assert_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "probability tensor contains either" in msg
+        or "device-side assert triggered" in msg
+        or "cuda error: device-side assert triggered" in msg
+    )
+
+
+def _load_model_with_dtype(model_size: str, dtype: torch.dtype) -> Qwen3TTSModel:
+    """Load a fresh Base model instance with specified dtype (no cache)."""
+    model_path = _resolve_model_path(model_size)
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    return Qwen3TTSModel.from_pretrained(
+        model_path,
+        device_map=device,
+        dtype=dtype,
+        attn_implementation="eager",
+    )
+
+
+def _generate_voice_clone_with_fallback(
+    model_size: str,
+    text: str,
+    language: str,
+    ref_audio: str,
+    ref_text: str,
+    x_vector_only_mode: bool,
+):
+    """
+    Generate voice clone audio. If CUDA sampling becomes numerically unstable under fp16
+    (probability tensor assert), retry once with fp32 for stability.
+    """
+    model = _get_model(model_size)
+    try:
+        return model.generate_voice_clone(
+            text=text,
+            language=language,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            x_vector_only_mode=x_vector_only_mode,
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        if torch.cuda.is_available() and _is_prob_tensor_assert_error(e):
+            # device-side assert 会污染当前进程的 CUDA 上下文，后续任何 torch.cuda 调用/加载都可能继续失败。
+            if "device-side assert triggered" in msg:
+                raise RuntimeError(
+                    "CUDA device-side assert triggered. "
+                    "该错误会污染当前进程的 CUDA 上下文，无法在同一进程内恢复。"
+                    "请重启服务进程后重试；建议设置 QWEN_TTS_FORCE_FP32=1 以提高稳定性（仍在 GPU 上运行）。"
+                ) from e
+
+            print("[WARN] CUDA 采样概率异常，尝试使用 GPU(float32) 重新生成一次（更稳定但更慢）")
+            # 注意：这里不要强依赖 torch.cuda.empty_cache()，避免极端情况下再次触发 CUDA 错误
+            model_fp32 = _load_model_with_dtype(model_size, torch.float32)
+            return model_fp32.generate_voice_clone(
+                text=text,
+                language=language,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                x_vector_only_mode=x_vector_only_mode,
+            )
+        raise
 
 
 def _check_enhancer_available() -> bool:
@@ -1158,7 +1240,8 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
 
         # 生成语音
         print(f"[任务 {task_id}] 生成语音中...")
-        wavs, sr = model.generate_voice_clone(
+        wavs, sr = _generate_voice_clone_with_fallback(
+            model_size=params["model"],
             text=text,
             language=params["lang"],
             ref_audio=model_ref_path,
@@ -1176,41 +1259,46 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         
         sf.write(audio_path, wav_out, sr, format="WAV")
         
-        # 生成字幕（可选，失败不影响主任务）
-        subtitle_srt_url = None
-        subtitle_json_url = None
-        subtitle_error = None
-        try:
-            if not _check_whisperx_available():
-                subtitle_error = "WhisperX 未安装，无法为合成结果生成字幕"
-            subtitle_data = _generate_subtitles_for_audio(audio_path, params["lang"], original_text=params.get("text", ""))
-            if subtitle_data:
-                srt_path, json_path = _write_subtitle_files(subtitle_data, audio_path)
-                if srt_path:
-                    subtitle_srt_url = f"/api/download/{user_id}/{task_id}?type=srt"
-                    print(f"[字幕] SRT 已生成: {os.path.basename(srt_path)}")
-                if json_path:
-                    subtitle_json_url = f"/api/download/{user_id}/{task_id}?type=json"
-                    print(f"[字幕] JSON 已生成: {os.path.basename(json_path)}")
-        except Exception as e:
-            subtitle_error = str(e)
-            print(f"[字幕] 生成跳过: {e}")
-        
-        # 更新任务状态为完成
+        # 先标记任务完成（避免字幕生成耗时导致一直卡 processing）
         task_data["status"] = "completed"
         task_data["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         task_data["audio_url"] = f"/api/download/{user_id}/{task_id}"
         task_data["audio_file"] = audio_filename
         task_data["sample_rate"] = int(sr)
-        if subtitle_srt_url:
-            task_data["subtitle_srt"] = subtitle_srt_url
-        if subtitle_json_url:
-            task_data["subtitle_json"] = subtitle_json_url
-        if subtitle_error:
-            task_data["subtitle_error"] = subtitle_error
         _save_task(user_id, task_id, task_data)
         
         print(f"[OK] 任务 {task_id} 完成 (时长: {len(wav_out)/sr:.1f}s)")
+
+        # 生成字幕（可选，失败不影响任务完成状态；生成后再写回字幕字段）
+        try:
+            if not _check_whisperx_available():
+                task_data = _get_task(user_id, task_id) or task_data
+                task_data["subtitle_error"] = "WhisperX 未安装，无法为合成结果生成字幕"
+                _save_task(user_id, task_id, task_data)
+            else:
+                t0 = time.time()
+                subtitle_data = _generate_subtitles_for_audio(
+                    audio_path,
+                    params["lang"],
+                    original_text=params.get("text", ""),
+                )
+                if subtitle_data:
+                    srt_path, json_path = _write_subtitle_files(subtitle_data, audio_path)
+                    task_data = _get_task(user_id, task_id) or task_data
+                    if srt_path:
+                        task_data["subtitle_srt"] = f"/api/download/{user_id}/{task_id}?type=srt"
+                        print(f"[字幕] SRT 已生成: {os.path.basename(srt_path)}")
+                    if json_path:
+                        task_data["subtitle_json"] = f"/api/download/{user_id}/{task_id}?type=json"
+                        print(f"[字幕] JSON 已生成: {os.path.basename(json_path)}")
+                    task_data["subtitle_generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    task_data["subtitle_elapsed_sec"] = round(time.time() - t0, 3)
+                    _save_task(user_id, task_id, task_data)
+        except Exception as e:
+            task_data = _get_task(user_id, task_id) or task_data
+            task_data["subtitle_error"] = str(e)
+            _save_task(user_id, task_id, task_data)
+            print(f"[字幕] 生成失败(不影响完成): {e}")
         
     except Exception as e:
         import traceback
@@ -1255,7 +1343,8 @@ def voice_clone_sync(req: VoiceCloneRequest):
         ref_text = _apply_polyphonic(req.ref_text)
         
         # 生成语音
-        wavs, sr = model.generate_voice_clone(
+        wavs, sr = _generate_voice_clone_with_fallback(
+            model_size=req.model_size,
             text=text,
             language=req.language,
             ref_audio=req.ref_audio_b64,
@@ -1519,32 +1608,26 @@ def delete_task(user_id: str, task_id: str):
 
 @app.post("/api/task/{user_id}/{task_id}/retry", tags=["任务管理"], summary="重试任务")
 def retry_task(user_id: str, task_id: str):
-    """使用原任务参数重新排队；参考音频从本地文件复制或从旧版 base64 落盘。"""
+    """使用原任务参数重新排队（复用原 task_id，不创建新任务）。"""
     try:
         task = _get_task(user_id, task_id)
         if not task:
             raise HTTPException(status_code=404, detail="任务不存在")
+        if task.get("status") == "processing":
+            raise HTTPException(status_code=400, detail="任务正在处理中，无法重试（如为僵死任务请先删除后再提交）")
         old_params = task.get("params")
         if not old_params:
             raise HTTPException(status_code=400, detail="无法重试：缺少任务参数")
 
         params = copy.deepcopy(old_params)
-        new_task_id = _generate_task_id()
         rel = params.get("ref_audio_rel")
         b64 = params.get("ref_audio_b64")
 
+        # 确保参考音频可用：优先使用已落盘的 ref_audio_rel；否则尝试从旧版 base64 落盘（复用当前 task_id）。
         if rel and isinstance(rel, str):
             src = os.path.join(TASKS_DIR, rel.replace("/", os.sep))
             if not os.path.isfile(src):
                 raise HTTPException(status_code=400, detail="参考音频文件已丢失，无法重试")
-            ext = os.path.splitext(rel)[1] or ".webm"
-            new_rel = f"ref_audio/{user_id}_{new_task_id}{ext}"
-            dst = os.path.join(TASKS_DIR, new_rel.replace("/", os.sep))
-            try:
-                shutil.copy2(src, dst)
-            except OSError as e:
-                raise HTTPException(status_code=500, detail=f"复制参考音频失败: {e}") from e
-            params["ref_audio_rel"] = new_rel
             params.pop("ref_audio_b64", None)
         elif b64 and isinstance(b64, str) and b64.strip() and b64 != "[已隐藏]":
             meta = {
@@ -1557,7 +1640,7 @@ def retry_task(user_id: str, task_id: str):
             raw = re.sub(r"[^A-Za-z0-9+/=]", "", raw)
             audio_bytes = base64.b64decode(raw)
             suffix = _guess_ref_audio_suffix(meta, audio_bytes, None)
-            new_rel = f"ref_audio/{user_id}_{new_task_id}{suffix}"
+            new_rel = f"ref_audio/{user_id}_{task_id}{suffix}"
             dst = os.path.join(TASKS_DIR, new_rel.replace("/", os.sep))
             with open(dst, "wb") as f:
                 f.write(audio_bytes)
@@ -1566,19 +1649,44 @@ def retry_task(user_id: str, task_id: str):
         else:
             raise HTTPException(status_code=400, detail="无法重试：缺少参考音频文件或数据")
 
-        task_data = {
-            "task_id": new_task_id,
-            "user_id": user_id,
-            "status": "pending",
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "params": params,
-        }
-        _save_task(user_id, new_task_id, task_data)
-        _TASK_QUEUE.put({"user_id": user_id, "task_id": new_task_id, "params": params})
+        # 清理旧输出文件（若存在）
+        if task.get("audio_file"):
+            audio_path = os.path.join(AUDIO_OUTPUT_DIR, task["audio_file"])
+            srt_path, json_path = _subtitle_paths_for_audio(audio_path)
+            for p in (audio_path, srt_path, json_path):
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+
+        # 重置任务字段（复用原 task_id）
+        task["status"] = "pending"
+        task["params"] = params
+        task["retry_count"] = int(task.get("retry_count") or 0) + 1
+        task["retried_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for k in (
+            "started_at",
+            "completed_at",
+            "failed_at",
+            "error",
+            "audio_url",
+            "audio_file",
+            "sample_rate",
+            "subtitle_srt",
+            "subtitle_json",
+            "subtitle_error",
+            "subtitle_generated_at",
+            "subtitle_elapsed_sec",
+        ):
+            task.pop(k, None)
+        _save_task(user_id, task_id, task)
+
+        _TASK_QUEUE.put({"user_id": user_id, "task_id": task_id, "params": params})
         _start_queue_worker()
         return {
             "ok": True,
-            "task_id": new_task_id,
+            "task_id": task_id,
             "user_id": user_id,
             "status": "pending",
             "message": "已重新加入队列",
@@ -1590,18 +1698,45 @@ def retry_task(user_id: str, task_id: str):
 
 
 @app.delete("/api/tasks/clear", tags=["任务管理"], summary="一键清除所有任务")
-def clear_all_tasks():
+def clear_all_tasks(include_processing: bool = Query(False)):
     """
     清除所有任务及其音频/字幕文件。
 
-    正在执行中（processing）的任务会被保留，其余全部删除。
+    默认保留正在执行中（processing）的任务；若 include_processing=true 则一并删除。
     """
     try:
-        result = _clear_all_tasks()
+        if include_processing:
+            deleted = 0
+            skipped = 0
+            # 复制一份 key 列表避免遍历时修改
+            with _TASKS_LOCK:
+                keys = list(_TASKS_STORE.keys())
+            for key in keys:
+                try:
+                    uid, tid = key.split(":", 1)
+                except ValueError:
+                    continue
+                if _delete_task(uid, tid):
+                    deleted += 1
+            # 再扫一遍磁盘残留（内存里未加载的）
+            for filename in list(os.listdir(TASKS_DIR)):
+                if not filename.endswith(".json") or "_" not in filename:
+                    continue
+                try:
+                    uid, rest = filename.split("_", 1)
+                    tid = rest[:-5]  # strip .json
+                except Exception:
+                    continue
+                if _delete_task(uid, tid):
+                    deleted += 1
+            result = {"deleted": deleted, "skipped_processing": skipped}
+        else:
+            result = _clear_all_tasks()
         return {
             "message": "清除完成",
             "deleted": result["deleted"],
             "skipped_processing": result["skipped_processing"],
+            "include_processing": include_processing,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"清除失败: {str(exc)}")

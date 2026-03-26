@@ -9,7 +9,7 @@
 - **音色设计 (Voice Design)** — 用文字描述想要的音色，模型自动生成
 - **10 语种支持** — 中/英/日/韩/德/法/俄/葡/西/意，支持自动语言检测
 - **异步任务队列** — 提交即返回，后台排队处理，支持状态轮询和任务管理
-- **ASR 辅助** — 集成 SenseVoice 自动识别参考音频文本，降低使用门槛
+- **ASR/字幕** — 集成 WhisperX 用于语音识别与字幕生成（SRT/JSON）
 - **GTCRN 降噪** — 参考音频自动降噪，提升克隆质量
 - **语速调节** — 基于 FFmpeg 的变速播放（0.1x ~ 5.0x）
 - **多音字纠正** — 内置中文多音字映射表
@@ -28,7 +28,7 @@
      │ api_server.py  │           │  api_base.py   │
      │  端口 8001      │           │ 端口 9770/9771  │
      │ CustomVoice     │           │ Voice Clone    │
-     │ VoiceDesign     │           │ + SenseVoice   │
+     │ VoiceDesign     │           │ + WhisperX     │
      │ Voice Clone     │           │ + GTCRN 降噪    │
      └───────┬────────┘           └───────┬────────┘
              │                             │
@@ -66,9 +66,6 @@ pip install -e .
 
 # 安装 FlashAttention 2（减少显存占用，推荐）
 pip install -U flash-attn --no-build-isolation
-
-# 安装 ASR 功能（可选，用于自动识别参考音频文本）
-pip install -r requirements-asr.txt
 ```
 
 ### 3. 下载模型
@@ -116,7 +113,7 @@ python api_server.py --port 8001
 | CustomVoice | ✅ | - |
 | VoiceDesign | ✅ | - |
 | Voice Clone | ✅ | ✅ |
-| ASR 语音识别 | - | ✅ (SenseVoice) |
+| ASR 语音识别 | ✅ (WhisperX) | ✅ (WhisperX) |
 | 音频降噪 | - | ✅ (GTCRN) |
 | 异步任务队列 | 基础 | 完整 (持久化) |
 | 任务管理 CRUD | 基础 | 完整 + 重试 |
@@ -136,7 +133,7 @@ python api_server.py --port 8001
 | `/api/task/{user_id}/{task_id}` | DELETE | 删除任务 |
 | `/api/download/{user_id}/{task_id}` | GET | 下载生成的音频 |
 | `/api/queue/status` | GET | 查询队列状态 |
-| `/api/asr` | POST | 语音识别（SenseVoice + GTCRN） |
+| `/api/asr` | POST | 语音识别（WhisperX + GTCRN） |
 | `/api/asr/status` | GET | ASR 功能状态 |
 | `/health` | GET | 健康检查 |
 
@@ -297,7 +294,6 @@ Qwen3-TTS/
 │   ├── inference/               # 高层推理 API
 │   └── cli/demo.py              # Gradio 演示
 ├── models/                      # 模型权重（需自行下载）
-├── SenseVoiceSmall/             # SenseVoice ASR 模型
 ├── scripts/gtcrn.py             # GTCRN 语音降噪
 ├── finetuning/                  # 微调训练工具
 ├── configs/polyphonic_map.json  # 多音字映射表
@@ -325,7 +321,7 @@ Qwen3-TTS/
 | 推理加速 | Accelerate, Flash Attention 2 |
 | API 框架 | FastAPI + Uvicorn |
 | 前端 | 原生 HTML/CSS/JS（暗色主题 SPA） |
-| ASR | FunASR + SenseVoice (ModelScope) |
+| ASR | WhisperX |
 | 音频降噪 | GTCRN |
 | 音频处理 | librosa, soundfile, torchaudio, FFmpeg |
 | 训练 | Accelerate + TensorBoard |
