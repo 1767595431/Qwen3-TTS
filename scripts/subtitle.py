@@ -144,12 +144,38 @@ def _get_align_model(language_code: str):
     device = _subtitle_device()
     model_dir = _ensure_whisperx_model_dir()
     cache_only = _use_local_only()
-    model_a, metadata = whisperx.load_align_model(
-        language_code=language_code,
-        device=device,
-        model_dir=model_dir,
-        model_cache_only=cache_only,
-    )
+    try:
+        model_a, metadata = whisperx.load_align_model(
+            language_code=language_code,
+            device=device,
+            model_dir=model_dir,
+            model_cache_only=cache_only,
+        )
+    except Exception as e:
+        # 常见原因：本地缓存“看起来有目录”但结构/文件不完整（例如缺少 preprocessor_config.json 或下载中断损坏）
+        # WhisperX/Transformers 更依赖 HF cache 结构（models--.../snapshots/...），因此这里尝试补全缓存后重试一次。
+        if cache_only:
+            raise
+        try:
+            from huggingface_hub import snapshot_download  # type: ignore
+
+            align_repo = whisperx.alignment.DEFAULT_ALIGN_MODELS.get(language_code)
+            if align_repo:
+                snapshot_download(
+                    repo_id=align_repo,
+                    cache_dir=model_dir,  # 关键：写入 HF cache 结构，让 transformers 能正确找到 preprocessor_config.json 等
+                    local_dir_use_symlinks=False,
+                    resume_download=True,
+                )
+        except Exception:
+            # 下载失败就保留原始异常信息
+            raise e
+        model_a, metadata = whisperx.load_align_model(
+            language_code=language_code,
+            device=device,
+            model_dir=model_dir,
+            model_cache_only=False,
+        )
     _WHISPERX_ALIGN_MODELS[language_code] = (model_a, metadata)
     return model_a, metadata
 

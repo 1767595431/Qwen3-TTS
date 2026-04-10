@@ -93,14 +93,23 @@ modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --local_dir ./m
 # 默认端口 9770
 python api_base.py --port 9770
 
+# 指定 GPU（物理编号；会写入 CUDA_VISIBLE_DEVICES）
+python api_base.py --port 9770 --gpu 1
+
+# 设置异步任务并发（worker 数，默认 1）
+python api_base.py --port 9770 --gpu 1 --workers 2
+
 # 或使用 bat 脚本（Windows）
-RunQwen3-TTS-9770.bat
+RunQwen3-TTS-9770.bat 9770 1 2
 ```
 
 **全功能服务**（CustomVoice + VoiceDesign + Clone）：
 
 ```bash
 python api_server.py --port 8001
+
+# 指定 GPU + 并发
+python api_server.py --port 8001 --gpu 0 --workers 1
 ```
 
 启动后访问 `http://localhost:9770`（或 `http://localhost:8001`）打开 Web 界面。

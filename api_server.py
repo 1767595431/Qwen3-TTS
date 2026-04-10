@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import threading
@@ -36,9 +37,129 @@ SCRIPTS_DIR = os.path.join(APP_DIR, "scripts")
 REF_AUDIO_DURATION_MIN = 5.0
 REF_AUDIO_DURATION_MAX = 15.0
 
+# 默认模型大小（用于“请求没传/不合法”时的兜底；可通过环境变量设置）
+DEFAULT_MODEL_SIZE = os.getenv("QWEN_TTS_DEFAULT_MODEL_SIZE", "").strip() or "1.7B"
+
+
+def _forced_model_size() -> Optional[str]:
+    v = (os.getenv("QWEN_TTS_FORCE_MODEL_SIZE") or "").strip()
+    return v if v in ("0.6B", "1.7B") else None
+
+
+def _effective_model_size(request_value: Optional[str]) -> str:
+    forced = _forced_model_size()
+    if forced:
+        return forced
+    v = (request_value or "").strip()
+    if v in ("0.6B", "1.7B"):
+        return v
+    return DEFAULT_MODEL_SIZE
+
 # 确保任务目录存在
 os.makedirs(TASKS_DIR, exist_ok=True)
 os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
+
+
+def _resolve_ffmpeg_path() -> Optional[str]:
+    """
+    Resolve ffmpeg executable path.
+
+    Priority:
+    - QWEN_TTS_FFMPEG / FFMPEG_PATH (explicit absolute or resolvable name)
+    - PATH via shutil.which("ffmpeg")
+    - Conda/venv prefix derived from sys.executable (e.g. <env>/bin/ffmpeg or <env>/Scripts/ffmpeg.exe)
+    """
+    for k in ("QWEN_TTS_FFMPEG", "FFMPEG_PATH"):
+        v = (os.getenv(k) or "").strip()
+        if not v:
+            continue
+        if os.path.isabs(v) and os.path.isfile(v):
+            return v
+        found = shutil.which(v)
+        if found:
+            return found
+
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    try:
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        cand_nt = os.path.join(exe_dir, "ffmpeg.exe")
+        if os.name == "nt" and os.path.isfile(cand_nt):
+            return cand_nt
+        cand_posix = os.path.join(exe_dir, "ffmpeg")
+        if os.path.isfile(cand_posix):
+            return cand_posix
+    except Exception:
+        pass
+
+    return None
+
+
+_FFMPEG_PATH: Optional[str] = _resolve_ffmpeg_path()
+
+
+def _ensure_ffmpeg_in_path() -> None:
+    """
+    Ensure subprocess can find `ffmpeg` via PATH.
+
+    WhisperX uses `subprocess.run(["ffmpeg", ...])` internally in its audio loader.
+    """
+    if not _FFMPEG_PATH:
+        return
+    ff_dir = os.path.dirname(_FFMPEG_PATH)
+    cur = os.getenv("PATH") or ""
+    parts = [p for p in cur.split(os.pathsep) if p]
+    if ff_dir in parts:
+        return
+    os.environ["PATH"] = ff_dir + os.pathsep + cur
+
+
+_ensure_ffmpeg_in_path()
+
+
+def _ffmpeg_cmd_or_raise() -> str:
+    if _FFMPEG_PATH:
+        return _FFMPEG_PATH
+    raise RuntimeError(
+        "未找到 ffmpeg。请确保 ffmpeg 在 PATH 中，或设置环境变量 "
+        "QWEN_TTS_FFMPEG=/path/to/ffmpeg（或 FFMPEG_PATH）。"
+    )
+
+
+def _preparse_flag_value(argv: List[str], flag: str) -> Optional[str]:
+    try:
+        i = argv.index(flag)
+    except ValueError:
+        return None
+    if i + 1 >= len(argv):
+        return ""
+    return str(argv[i + 1]).strip()
+
+
+def _apply_cuda_visible_devices_from_argv() -> None:
+    if os.getenv("CUDA_VISIBLE_DEVICES", "").strip():
+        return
+    gpu = os.getenv("QWEN_TTS_GPU", "").strip()
+    if not gpu:
+        gpu = _preparse_flag_value(sys.argv, "--gpu") or ""
+    if gpu == "":
+        return
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+
+
+def _apply_queue_workers_from_argv() -> None:
+    if os.getenv("QWEN_TTS_QUEUE_WORKERS", "").strip():
+        return
+    raw = _preparse_flag_value(sys.argv, "--workers") or _preparse_flag_value(sys.argv, "--queue-workers")
+    if raw is None or raw == "":
+        return
+    os.environ["QWEN_TTS_QUEUE_WORKERS"] = raw
+
+
+_apply_cuda_visible_devices_from_argv()
+_apply_queue_workers_from_argv()
 
 
 def _resolve_model_path(model_type: str, model_size: str) -> str:
@@ -78,7 +199,19 @@ _WHISPERX_AVAILABLE: Optional[bool] = None
 _TASKS_STORE: Dict[str, Dict] = {}  # 内存中的任务存储
 _TASKS_LOCK = threading.Lock()  # 任务存储的线程锁
 _TASK_QUEUE = Queue()  # 任务队列
-_QUEUE_WORKER_STARTED = False  # 标记队列工作线程是否已启动
+_QUEUE_WORKER_STARTED = False  # 兼容旧变量：是否曾启动过
+_QUEUE_WORKERS_STARTED = 0
+_QUEUE_WORKERS_LOCK = threading.Lock()
+
+
+def _queue_workers_target() -> int:
+    raw = os.getenv("QWEN_TTS_QUEUE_WORKERS", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except Exception:
+            return 1
+    return 1
 
 
 def _generate_task_id() -> str:
@@ -204,12 +337,18 @@ def _queue_worker():
 
 def _start_queue_worker():
     """启动队列工作线程"""
-    global _QUEUE_WORKER_STARTED
-    if not _QUEUE_WORKER_STARTED:
-        worker_thread = threading.Thread(target=_queue_worker, daemon=True)
-        worker_thread.start()
+    global _QUEUE_WORKER_STARTED, _QUEUE_WORKERS_STARTED
+    target = _queue_workers_target()
+    with _QUEUE_WORKERS_LOCK:
+        if _QUEUE_WORKERS_STARTED >= target:
+            _QUEUE_WORKER_STARTED = True
+            return
+        while _QUEUE_WORKERS_STARTED < target:
+            worker_thread = threading.Thread(target=_queue_worker, daemon=True)
+            worker_thread.start()
+            _QUEUE_WORKERS_STARTED += 1
         _QUEUE_WORKER_STARTED = True
-        print("[Queue Worker] 队列工作线程初始化完成")
+        print(f"[Queue Worker] 队列工作线程初始化完成: workers={target}")
 
 
 def _get_model(model_type: str, model_size: str) -> Qwen3TTSModel:
@@ -313,8 +452,9 @@ def _apply_speed_ffmpeg(wav: np.ndarray, sr: int, speed: float) -> np.ndarray:
         flt = _build_atempo_filter(speed)
         # Pad after time-stretch to avoid clipping the last phoneme.
         flt = f"{flt},apad=pad_dur=0.4"
+        ffmpeg_bin = _ffmpeg_cmd_or_raise()
         cmd = [
-            "ffmpeg",
+            ffmpeg_bin,
             "-y",
             "-loglevel",
             "error",
@@ -324,7 +464,10 @@ def _apply_speed_ffmpeg(wav: np.ndarray, sr: int, speed: float) -> np.ndarray:
             flt,
             out_path,
         ]
-        subprocess.run(cmd, check=True)
+        run_kw: Dict[str, Any] = {"check": True}
+        if os.name == "nt":
+            run_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.run(cmd, **run_kw)
         out_wav, _ = sf.read(out_path, dtype="float32", always_2d=False)
         if out_wav.ndim > 1:
             out_wav = np.mean(out_wav, axis=-1)
@@ -526,7 +669,7 @@ class CustomVoiceRequest(BaseModel):
     instruct: str | None = None
     speed: float = Field(1.0, ge=0.1)
     speed_enabled: bool = True
-    model_size: str = "1.7B"
+    model_size: str = DEFAULT_MODEL_SIZE
 
 
 class VoiceDesignRequest(BaseModel):
@@ -535,7 +678,7 @@ class VoiceDesignRequest(BaseModel):
     language: str = "Auto"
     speed: float = Field(1.0, ge=0.1)
     speed_enabled: bool = True
-    model_size: str = "1.7B"
+    model_size: str = DEFAULT_MODEL_SIZE
 
 
 class VoiceCloneRequest(BaseModel):
@@ -546,7 +689,7 @@ class VoiceCloneRequest(BaseModel):
     x_vector_only_mode: bool = False
     speed: float = Field(1.0, ge=0.1)
     speed_enabled: bool = True
-    model_size: str = "1.7B"
+    model_size: str = DEFAULT_MODEL_SIZE
 
 
 class VoiceCloneAPIRequest(BaseModel):
@@ -558,7 +701,7 @@ class VoiceCloneAPIRequest(BaseModel):
     ref_text: str = Field(..., min_length=1, description="参考音频对应的文本")
     speed: float = Field(1.0, ge=0.1, le=5.0, description="语速，范围0.1-5.0")
     lang: str = Field("English", description="语言，如English, Chinese等")
-    model: str = Field("1.7B", description="模型大小：0.6B 或 1.7B")
+    model: str = Field(DEFAULT_MODEL_SIZE, description="模型大小：0.6B 或 1.7B")
 
 
 app = FastAPI(title="Qwen3-TTS API")
@@ -576,6 +719,16 @@ def startup_preload_models():
     print("\n" + "=" * 60)
     print("正在启动 Qwen3-TTS 全功能服务...")
     print("=" * 60)
+
+    try:
+        device, dtype = _default_device_and_dtype()
+        print(f"[INFO] TTS 推理精度: device={device}, dtype={str(dtype).replace('torch.', '')}")
+    except Exception as e:
+        print(f"[WARN] 无法获取 TTS device/dtype: {e}")
+    try:
+        print(f"[INFO] 队列并发: workers={_queue_workers_target()}")
+    except Exception as e:
+        print(f"[WARN] 无法读取队列并发配置: {e}")
 
     if _check_whisperx_available():
         try:
@@ -614,7 +767,9 @@ def health():
 @app.post("/api/custom-voice")
 def custom_voice(req: CustomVoiceRequest):
     try:
-        model = _get_model("custom_voice", req.model_size)
+        # 模型选择：命令行/环境变量优先级最高（请求参数保留但不生效）
+        model_size = _effective_model_size(req.model_size)
+        model = _get_model("custom_voice", model_size)
         text = _apply_polyphonic(req.text)
         wavs, sr = model.generate_custom_voice(
             text=text,
@@ -651,7 +806,9 @@ def custom_voice(req: CustomVoiceRequest):
 @app.post("/api/voice-design")
 def voice_design(req: VoiceDesignRequest):
     try:
-        model = _get_model("voice_design", req.model_size)
+        # 模型选择：命令行/环境变量优先级最高（请求参数保留但不生效）
+        model_size = _effective_model_size(req.model_size)
+        model = _get_model("voice_design", model_size)
         text = _apply_polyphonic(req.text)
         wavs, sr = model.generate_voice_design(
             text=text,
@@ -695,9 +852,11 @@ def voice_clone(req: VoiceCloneRequest):
             raise HTTPException(status_code=400, detail=str(e))
         text = _apply_polyphonic(req.text)
         ref_text = _apply_polyphonic(req.ref_text)
+        # 模型选择：命令行/环境变量优先级最高（请求参数保留但不生效）
+        model_size = _effective_model_size(req.model_size)
         wavs, sr = _generate_voice_clone_with_fallback(
             model_type="base",
-            model_size=req.model_size,
+            model_size=model_size,
             text=text,
             language=req.language,
             ref_audio=req.ref_audio_b64,
@@ -742,7 +901,9 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         task_data["started_at"] = datetime.now().isoformat()
         _save_task(user_id, task_id, task_data)
         
-        # 加载模型
+        # 模型选择：命令行/环境变量优先级最高（请求参数保留但不生效）
+        params = dict(params)
+        params["model"] = _effective_model_size(params.get("model"))
         # 处理文本（移除拼音标注）
         text = _apply_polyphonic(params["text"])
         ref_text = _apply_polyphonic(params["ref_text"])
@@ -832,9 +993,8 @@ def submit_voice_clone_task(req: VoiceCloneAPIRequest):
     - status: 任务状态（pending/processing/completed/failed）
     """
     try:
-        # 验证模型参数
-        if req.model not in ("0.6B", "1.7B"):
-            raise ValueError(f"不支持的模型: {req.model}，请使用 0.6B 或 1.7B")
+        # 模型选择：命令行/环境变量优先级最高（请求参数保留但不生效）
+        forced_model = _effective_model_size(req.model)
         
         # 验证参考音频时长（5-15 秒）
         try:
@@ -864,7 +1024,7 @@ def submit_voice_clone_task(req: VoiceCloneAPIRequest):
                 "ref_audio_b64": req.ref_audio_b64,
                 "speed": req.speed,
                 "lang": req.lang,
-                "model": req.model,
+                "model": forced_model,
             }
         }
         _save_task(user_id, task_id, task_data)
@@ -1126,5 +1286,31 @@ def get_queue_status():
 
 if __name__ == "__main__":
     import uvicorn
+    import argparse
 
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    parser = argparse.ArgumentParser(description="Qwen3-TTS 全功能服务")
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8001)
+    parser.add_argument("--gpu", type=str, default=os.getenv("QWEN_TTS_GPU", "").strip(),
+                        help="使用第几张显卡（写入 CUDA_VISIBLE_DEVICES）。例如 --gpu 1；留空则不设置")
+    parser.add_argument("--workers", type=int, default=int(os.getenv("QWEN_TTS_QUEUE_WORKERS", "1")),
+                        help="异步任务并发 worker 数（默认 1）。例如 --workers 2")
+    parser.add_argument(
+        "--model-size",
+        type=str,
+        default=os.getenv("QWEN_TTS_DEFAULT_MODEL_SIZE", "").strip() or DEFAULT_MODEL_SIZE,
+        choices=["0.6B", "1.7B"],
+        help="默认模型大小（仅当显式传 --model-size 时才强制覆盖请求中的 model/model_size）。可选: 0.6B / 1.7B",
+    )
+    args = parser.parse_args()
+
+    if args.gpu:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu).strip()
+    if args.workers and int(args.workers) > 0:
+        os.environ["QWEN_TTS_QUEUE_WORKERS"] = str(int(args.workers))
+    # 只有显式传了 --model-size 才启用“强制覆盖请求模型”的模式
+    if "--model-size" in sys.argv:
+        os.environ["QWEN_TTS_FORCE_MODEL_SIZE"] = str(args.model_size).strip()
+        os.environ["QWEN_TTS_DEFAULT_MODEL_SIZE"] = str(args.model_size).strip()
+
+    uvicorn.run(app, host=args.host, port=args.port)
