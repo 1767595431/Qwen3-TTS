@@ -1075,59 +1075,26 @@ def _normalize_text_for_tts(text: str) -> str:
     return text.strip()
 
 
-def _ensure_trailing_guard(text: str) -> str:
-    """在每个片段末尾追加 '…嗯~' 防止模型吃掉最后一个字（社区方案）。"""
+def _append_trailing_cjk_blanks(text: str) -> str:
+    """
+    在待合成正文末尾追加表意文字空格（U+3000，中文全角空白），用于减轻尾字被截断。
+    不应被念成「嗯」等音节；是否生效取决于分词与声学模型。
+
+    环境变量：
+    - QWEN_TTS_TAIL_BLANK_GUARD：设为 0/false 关闭追加
+    - QWEN_TTS_TAIL_IDEOGRAPHIC_SPACES：追加个数，默认 4，最大 32
+    """
     text = text.rstrip()
     if not text:
         return text
-    return text + "…嗯~"
-
-
-def _trim_trailing_guard(wav: np.ndarray, sr: int, search_sec: float = 2.0) -> np.ndarray:
-    """裁掉末尾 '…嗯~' 产生的牺牲音频。
-    从音频末尾反向检测：跳过尾部静音 → 跳过'嗯'语音 → 找到'…'的静音间隙 → 在此处切断。
-    """
-    min_samples = int(sr * 0.5)
-    if len(wav) < min_samples:
-        return wav
-
-    frame_len = int(sr * 0.02)
-    hop = frame_len // 2
-    search_samples = min(int(sr * search_sec), len(wav))
-    tail = wav[-search_samples:]
-
-    n_frames = max(1, (len(tail) - frame_len) // hop + 1)
-    rms = np.array([
-        np.sqrt(np.mean(tail[i * hop:i * hop + frame_len] ** 2))
-        for i in range(n_frames)
-    ])
-
-    threshold = max(np.median(rms) * 0.12, np.max(rms) * 0.03)
-    is_voice = rms > threshold
-
-    i = n_frames - 1
-    while i >= 0 and not is_voice[i]:
-        i -= 1
-    en_voice_end = i
-
-    while i >= 0 and is_voice[i]:
-        i -= 1
-    en_silence_end = i
-
-    if en_silence_end <= 0 or en_voice_end <= en_silence_end:
-        return wav
-
-    cut_frame = en_silence_end
-    cut_sample = len(wav) - search_samples + cut_frame * hop
-
-    if cut_sample < len(wav) // 2:
-        return wav
-
-    fade_len = min(int(sr * 0.03), cut_sample)
-    fade = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
-    result = wav[:cut_sample].copy()
-    result[-fade_len:] *= fade
-    return result
+    if (os.getenv("QWEN_TTS_TAIL_BLANK_GUARD", "1").strip().lower() in ("0", "false", "no")):
+        return text
+    try:
+        n = int(os.getenv("QWEN_TTS_TAIL_IDEOGRAPHIC_SPACES", "4").strip() or "4")
+    except ValueError:
+        n = 4
+    n = max(0, min(n, 32))
+    return text + ("\u3000" * n)
 
 
 def _apply_polyphonic(text: str) -> str:
@@ -1146,7 +1113,7 @@ class VoiceCloneRequest(BaseModel):
     ref_text: str = Field(..., min_length=1, description="参考音频对应的文本")
     speed: float = Field(1.0, ge=0.1, le=5.0, description="语速，范围0.1-5.0")
     speed_enabled: bool = Field(True, description="是否启用语速调整")
-    language: str = Field("English", description="语言，如English, Chinese等")
+    language: str = Field("Auto", description="语言：Auto（推荐，随内容）或 Chinese、English 等")
     model_size: str = Field(DEFAULT_MODEL_SIZE, description="模型大小：0.6B 或 1.7B")
     x_vector_only_mode: bool = Field(False, description="是否只使用 x-vector 模式")
 
@@ -1341,6 +1308,54 @@ async def recognize_audio(file: UploadFile = File(...)):
                 pass
 
 
+def _clone_task_log(task_id: str, msg: str) -> None:
+    """队列内任务里程碑日志（flush 便于 Linux 无缓冲排查「卡死在 processing」）。"""
+    print(f"[任务 {task_id}] {datetime.now().strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def _run_subtitles_for_completed_task(
+    user_id: str,
+    task_id: str,
+    audio_path: str,
+    lang: str,
+    original_text: str,
+) -> None:
+    """
+    WhisperX 字幕生成并写回任务 JSON。可与 TTS 队列解耦（后台线程调用）。
+    若与下一任务 TTS 并发抢 GPU 导致不稳，可设 QWEN_TTS_SUBTITLE_ASYNC=0 恢复同步。
+    """
+    try:
+        if not _check_whisperx_available():
+            task_data = _get_task(user_id, task_id)
+            if task_data:
+                task_data["subtitle_error"] = "WhisperX 未安装，无法为合成结果生成字幕"
+                _save_task(user_id, task_id, task_data)
+            return
+        t0 = time.time()
+        subtitle_data = _generate_subtitles_for_audio(
+            audio_path,
+            lang,
+            original_text=original_text,
+        )
+        if subtitle_data:
+            srt_path, json_path = _write_subtitle_files(subtitle_data, audio_path)
+            task_data = _get_task(user_id, task_id) or {}
+            if srt_path:
+                task_data["subtitle_srt"] = f"/api/download/{user_id}/{task_id}?type=srt"
+                print(f"[字幕] SRT 已生成: {os.path.basename(srt_path)}", flush=True)
+            if json_path:
+                task_data["subtitle_json"] = f"/api/download/{user_id}/{task_id}?type=json"
+                print(f"[字幕] JSON 已生成: {os.path.basename(json_path)}", flush=True)
+            task_data["subtitle_generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            task_data["subtitle_elapsed_sec"] = round(time.time() - t0, 3)
+            _save_task(user_id, task_id, task_data)
+    except Exception as e:
+        task_data = _get_task(user_id, task_id) or {}
+        task_data["subtitle_error"] = str(e)
+        _save_task(user_id, task_id, task_data)
+        print(f"[字幕] 生成失败(不影响完成): {e}", flush=True)
+
+
 def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
     """后台处理语音克隆任务"""
     cleanup_ref_path = None  # 仅删除临时转码的 wav，不删 tasks/ref_audio 下已保存文件
@@ -1353,16 +1368,21 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         task_data["status"] = "processing"
         task_data["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _save_task(user_id, task_id, task_data)
+        _clone_task_log(task_id, "开始处理（workers=1 时其它任务在此之后排队）")
         
         # 模型选择：若启动时传了 --model-size（强制模式）则覆盖请求；否则尊重请求参数
         params = dict(params)
         params["model"] = _effective_model_size(params.get("model"))
+        _clone_task_log(task_id, f"加载 TTS 模型: {params['model']}")
+        t_model = time.time()
         model = _get_model(params["model"])
+        _clone_task_log(task_id, f"模型已就绪，耗时 {time.time() - t_model:.2f}s")
         
-        # 处理文本（移除拼音标注 + 末尾防截断）
-        text = _ensure_trailing_guard(_apply_polyphonic(params["text"]))
+        # 处理文本（移除拼音标注 + 末尾全角空白防截断，不追加可读语气词）
+        text = _append_trailing_cjk_blanks(_apply_polyphonic(params["text"]))
         ref_text = _apply_polyphonic(params["ref_text"])
         
+        _clone_task_log(task_id, "准备参考音频（如需 ffmpeg 转 16kHz 可能耗时）")
         # 参考音频：优先使用提交时已保存的本地文件（避免排队后 base64 再解码丢格式）
         rel = params.get("ref_audio_rel")
         if rel and isinstance(rel, str):
@@ -1393,8 +1413,12 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
             )
             cleanup_ref_path = model_ref_path
 
-        # 生成语音
-        print(f"[任务 {task_id}] 生成语音中...")
+        # 生成语音（此处最耗时；若长时间无下一条日志，多为 GPU 推理挂起或极长文本）
+        _clone_task_log(
+            task_id,
+            f"开始 generate_voice_clone：len(text)={len(text)} lang={params.get('lang')} speed={params.get('speed')}",
+        )
+        t_gen = time.time()
         wavs, sr = _generate_voice_clone_with_fallback(
             model_size=params["model"],
             text=text,
@@ -1403,10 +1427,13 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
             ref_text=ref_text,
             x_vector_only_mode=False,
         )
-        
-        # 裁掉末尾牺牲音频（…嗯~），再应用语速调整
-        wav_raw = _trim_trailing_guard(np.asarray(wavs[0], dtype=np.float32), sr)
+        _clone_task_log(task_id, f"generate_voice_clone 结束，耗时 {time.time() - t_gen:.2f}s，sr={sr}")
+
+        wav_raw = np.asarray(wavs[0], dtype=np.float32)
+        _clone_task_log(task_id, f"开始语速/后处理 _apply_speed(speed={params.get('speed')})")
+        t_sp = time.time()
         wav_out = _apply_speed(wav_raw, params["speed"], sr)
+        _clone_task_log(task_id, f"_apply_speed 结束，耗时 {time.time() - t_sp:.2f}s")
         
         # 保存音频文件
         audio_filename = f"{user_id}_{task_id}.wav"
@@ -1422,38 +1449,21 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         task_data["sample_rate"] = int(sr)
         _save_task(user_id, task_id, task_data)
         
-        print(f"[OK] 任务 {task_id} 完成 (时长: {len(wav_out)/sr:.1f}s)")
+        print(f"[OK] 任务 {task_id} 完成 (时长: {len(wav_out)/sr:.1f}s)", flush=True)
 
-        # 生成字幕（可选，失败不影响任务完成状态；生成后再写回字幕字段）
-        try:
-            if not _check_whisperx_available():
-                task_data = _get_task(user_id, task_id) or task_data
-                task_data["subtitle_error"] = "WhisperX 未安装，无法为合成结果生成字幕"
-                _save_task(user_id, task_id, task_data)
-            else:
-                t0 = time.time()
-                subtitle_data = _generate_subtitles_for_audio(
-                    audio_path,
-                    params["lang"],
-                    original_text=params.get("text", ""),
-                )
-                if subtitle_data:
-                    srt_path, json_path = _write_subtitle_files(subtitle_data, audio_path)
-                    task_data = _get_task(user_id, task_id) or task_data
-                    if srt_path:
-                        task_data["subtitle_srt"] = f"/api/download/{user_id}/{task_id}?type=srt"
-                        print(f"[字幕] SRT 已生成: {os.path.basename(srt_path)}")
-                    if json_path:
-                        task_data["subtitle_json"] = f"/api/download/{user_id}/{task_id}?type=json"
-                        print(f"[字幕] JSON 已生成: {os.path.basename(json_path)}")
-                    task_data["subtitle_generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    task_data["subtitle_elapsed_sec"] = round(time.time() - t0, 3)
-                    _save_task(user_id, task_id, task_data)
-        except Exception as e:
-            task_data = _get_task(user_id, task_id) or task_data
-            task_data["subtitle_error"] = str(e)
-            _save_task(user_id, task_id, task_data)
-            print(f"[字幕] 生成失败(不影响完成): {e}")
+        # 字幕：默认后台线程，不阻塞队列上下一个 TTS（多任务连发时更顺滑）
+        lang = params.get("lang", "")
+        orig = params.get("text", "")
+        if os.getenv("QWEN_TTS_SUBTITLE_ASYNC", "1").strip().lower() in ("0", "false", "no"):
+            _run_subtitles_for_completed_task(user_id, task_id, audio_path, lang, orig)
+        else:
+            threading.Thread(
+                target=_run_subtitles_for_completed_task,
+                args=(user_id, task_id, audio_path, lang, orig),
+                daemon=True,
+                name=f"wx-sub-{task_id}",
+            ).start()
+            _clone_task_log(task_id, "字幕已交后台线程（队列可立即处理下一任务）")
         
     except Exception as e:
         import traceback
@@ -1494,8 +1504,7 @@ def voice_clone_sync(req: VoiceCloneRequest):
         req_model_size = _effective_model_size(req.model_size)
         model = _get_model(req_model_size)
         
-        # 处理文本（末尾防截断）
-        text = _ensure_trailing_guard(_apply_polyphonic(req.text))
+        text = _append_trailing_cjk_blanks(_apply_polyphonic(req.text))
         ref_text = _apply_polyphonic(req.ref_text)
         
         # 生成语音
@@ -1508,8 +1517,7 @@ def voice_clone_sync(req: VoiceCloneRequest):
             x_vector_only_mode=req.x_vector_only_mode,
         )
         
-        # 裁掉末尾牺牲音频（…嗯~），再应用语速调整
-        wav_raw = _trim_trailing_guard(np.asarray(wavs[0], dtype=np.float32), sr)
+        wav_raw = np.asarray(wavs[0], dtype=np.float32)
         wav_out = _apply_speed(
             wav_raw,
             req.speed if req.speed_enabled else 1.0,
@@ -1547,7 +1555,7 @@ async def submit_voice_clone_task_upload(
     ref_audio: UploadFile = File(...),
     task_id: Optional[str] = Form(None),
     speed: float = Form(1.0),
-    lang: str = Form("English"),
+    lang: str = Form("Auto"),
     model: str = Form(DEFAULT_MODEL_SIZE),
 ):
     """
@@ -1560,7 +1568,7 @@ async def submit_voice_clone_task_upload(
     - ref_audio: 参考音频文件（必填，3-15秒）
     - task_id: 任务ID（可选，不填则自动生成）
     - speed: 语速（默认1.0，范围0.1-5.0）
-    - lang: 语言（默认English）
+    - lang: 语言（默认 Auto；中文合成请勿用 English）
     - model: 模型大小（默认1.7B，可选0.6B）
     
     返回：
