@@ -35,6 +35,9 @@ models/
 tasks/audio/
 tasks/*.json
 
+# Embedded Python runtime (too large for git)
+runtime/
+
 # Large assets
 assets/*.pdf
 
