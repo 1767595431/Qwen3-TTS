@@ -87,11 +87,33 @@ modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --local_dir ./m
 
 ### 4. 启动服务
 
+> **防吞字机制**
+>
+> Qwen3-TTS 自回归模型在文本末尾容易提前触发 EOS，导致尾字/尾词被吞。
+> 本仓库的解决方案：
+>
+> - 合成时自动在原文末尾追加防吞字后缀
+>   - **短文本（≤100 字）**：追加 `……。`（静音标点，不发声，无需裁切）
+>   - **长文本（>100 字）**：追加 `…嗯~`（模型在长文本中通常会自行吞掉该后缀）
+> - 该机制默认启用，无需任何额外参数
+
+> **2080Ti 等较老 GPU 兼容**
+>
+> 2080Ti（Turing 架构）在 FP16 半精度下可能出现 `CUDA device-side assert` 错误。
+> 启动时加 `--fp32` 参数即可解决，强制使用 FP32 精度（仍在 GPU 上运行）：
+> ```
+> python api_base.py --port 9770 --gpu 0 --workers 1 --fp32
+> ```
+> 代价：速度约慢 30-50%，显存占用约翻倍（1.7B 模型 FP32 约需 7-8GB 显存）。
+
 **语音克隆专用服务**（推荐，含 ASR + 降噪）：
 
 ```bash
-# 默认端口 9770
-python api_base.py --port 9770
+# 默认（4090 / 3090 等新卡）
+python api_base.py --port 9770 --gpu 0 --workers 1
+
+# 2080Ti 等较老 GPU
+python api_base.py --port 9770 --gpu 0 --workers 1 --fp32
 
 # 指定 GPU（物理编号；会写入 CUDA_VISIBLE_DEVICES）
 python api_base.py --port 9770 --gpu 1

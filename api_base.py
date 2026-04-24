@@ -64,6 +64,14 @@ def _apply_queue_workers_from_argv() -> None:
     os.environ["QWEN_TTS_QUEUE_WORKERS"] = raw
 
 
+def _apply_fp32_from_argv() -> None:
+    """预解析 --fp32 参数，在 import torch 前设置环境变量。"""
+    if os.getenv("QWEN_TTS_FORCE_FP32", "").strip():
+        return
+    if "--fp32" in sys.argv:
+        os.environ["QWEN_TTS_FORCE_FP32"] = "1"
+
+
 def _apply_cuda_visible_devices() -> None:
     # 若用户已显式设置 CUDA_VISIBLE_DEVICES，则不覆盖
     if os.getenv("CUDA_VISIBLE_DEVICES", "").strip():
@@ -81,6 +89,7 @@ def _apply_cuda_visible_devices() -> None:
 
 _apply_cuda_visible_devices()
 _apply_queue_workers_from_argv()
+_apply_fp32_from_argv()
 
 # 屏蔽 pyannote/torchcodec 的 torchcodec 加载失败警告（不影响 WhisperX 功能）
 warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
@@ -103,7 +112,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from qwen_tts import Qwen3TTSModel
+from faster_qwen3_tts import FasterQwen3TTS
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(APP_DIR, "models")
@@ -248,7 +257,7 @@ def _default_device_and_dtype() -> Tuple[str, torch.dtype]:
     return "cpu", torch.float32
 
 
-_MODEL_CACHE: Dict[str, Qwen3TTSModel] = {}
+_MODEL_CACHE: Dict[str, FasterQwen3TTS] = {}
 _ENHANCER_AVAILABLE: Optional[bool] = None  # GTCRN 降噪是否可用
 _WHISPERX_AVAILABLE: Optional[bool] = None  # WhisperX 是否可用（语音识别 + 字幕生成）
 _TASKS_STORE: Dict[str, Dict] = {}  # 内存中的任务存储
@@ -537,16 +546,16 @@ def _start_queue_worker():
         _QUEUE_WORKER_STARTED = True
 
 
-def _get_model(model_size: str) -> Qwen3TTSModel:
-    """仅加载语音克隆 Base 模型"""
+def _get_model(model_size: str) -> FasterQwen3TTS:
+    """仅加载语音克隆 Base 模型（使用 faster-qwen3-tts 加速）"""
     if model_size not in _MODEL_CACHE:
         model_path = _resolve_model_path(model_size)
         device, dtype = _default_device_and_dtype()
-        model = Qwen3TTSModel.from_pretrained(
+        model = FasterQwen3TTS.from_pretrained(
             model_path,
-            device_map=device,
+            device=device,
             dtype=dtype,
-            attn_implementation="eager",
+            attn_implementation="sdpa",
         )
         _MODEL_CACHE[model_size] = model
     return _MODEL_CACHE[model_size]
@@ -561,15 +570,15 @@ def _is_prob_tensor_assert_error(exc: Exception) -> bool:
     )
 
 
-def _load_model_with_dtype(model_size: str, dtype: torch.dtype) -> Qwen3TTSModel:
+def _load_model_with_dtype(model_size: str, dtype: torch.dtype) -> FasterQwen3TTS:
     """Load a fresh Base model instance with specified dtype (no cache)."""
     model_path = _resolve_model_path(model_size)
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    return Qwen3TTSModel.from_pretrained(
+    return FasterQwen3TTS.from_pretrained(
         model_path,
-        device_map=device,
+        device=device,
         dtype=dtype,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     )
 
 
@@ -580,9 +589,11 @@ def _generate_voice_clone_with_fallback(
     ref_audio: str,
     ref_text: str,
     x_vector_only_mode: bool,
+    **kwargs,
 ):
     """
-    Generate voice clone audio. If CUDA sampling becomes numerically unstable under fp16
+    Generate voice clone audio via faster-qwen3-tts.
+    If CUDA sampling becomes numerically unstable under fp16
     (probability tensor assert), retry once with fp32 for stability.
     """
     model = _get_model(model_size)
@@ -592,12 +603,12 @@ def _generate_voice_clone_with_fallback(
             language=language,
             ref_audio=ref_audio,
             ref_text=ref_text,
-            x_vector_only_mode=x_vector_only_mode,
+            xvec_only=x_vector_only_mode,
+            **kwargs,
         )
     except Exception as e:
         msg = str(e).lower()
         if torch.cuda.is_available() and _is_prob_tensor_assert_error(e):
-            # device-side assert 会污染当前进程的 CUDA 上下文，后续任何 torch.cuda 调用/加载都可能继续失败。
             if "device-side assert triggered" in msg:
                 raise RuntimeError(
                     "CUDA device-side assert triggered. "
@@ -606,14 +617,14 @@ def _generate_voice_clone_with_fallback(
                 ) from e
 
             print("[WARN] CUDA 采样概率异常，尝试使用 GPU(float32) 重新生成一次（更稳定但更慢）")
-            # 注意：这里不要强依赖 torch.cuda.empty_cache()，避免极端情况下再次触发 CUDA 错误
             model_fp32 = _load_model_with_dtype(model_size, torch.float32)
             return model_fp32.generate_voice_clone(
                 text=text,
                 language=language,
                 ref_audio=ref_audio,
                 ref_text=ref_text,
-                x_vector_only_mode=x_vector_only_mode,
+                xvec_only=x_vector_only_mode,
+                **kwargs,
             )
         raise
 
@@ -1061,50 +1072,6 @@ def _encode_wav_base64(wav, sr: int) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _strip_inline_pinyin(text: str) -> str:
-    """Strip inline pinyin annotations like 汉[pin1] / 汉(pin1) / 汉{pin1} to avoid reading pinyin."""
-    # Remove inline pinyin markers to prevent model from reading the pinyin letters
-    text = re.sub(r'[\(\[\{]\s*[a-zA-Z0-9,，\s]+\s*[\)\]\}]', '', text)
-    return text
-
-
-def _normalize_text_for_tts(text: str) -> str:
-    """Collapse newlines and excess whitespace so the model sees a single paragraph."""
-    text = re.sub(r'\r\n|\r|\n', ' ', text)
-    text = re.sub(r'\s{2,}', ' ', text)
-    return text.strip()
-
-
-def _append_trailing_cjk_blanks(text: str) -> str:
-    """
-    在待合成正文末尾追加表意文字空格（U+3000，中文全角空白），用于减轻尾字被截断。
-    不应被念成「嗯」等音节；是否生效取决于分词与声学模型。
-
-    环境变量：
-    - QWEN_TTS_TAIL_BLANK_GUARD：设为 0/false 关闭追加
-    - QWEN_TTS_TAIL_IDEOGRAPHIC_SPACES：追加个数，默认 4，最大 32
-    """
-    text = text.rstrip()
-    if not text:
-        return text
-    if (os.getenv("QWEN_TTS_TAIL_BLANK_GUARD", "1").strip().lower() in ("0", "false", "no")):
-        return text
-    try:
-        n = int(os.getenv("QWEN_TTS_TAIL_IDEOGRAPHIC_SPACES", "4").strip() or "4")
-    except ValueError:
-        n = 4
-    n = max(0, min(n, 32))
-    return text + ("\u3000" * n)
-
-
-def _apply_polyphonic(text: str) -> str:
-    """Clean up text before synthesis: normalise whitespace + strip pinyin annotations."""
-    if not text:
-        return text
-    text = _normalize_text_for_tts(text)
-    text = _strip_inline_pinyin(text)
-    return text
-
 
 class VoiceCloneRequest(BaseModel):
     """同步语音克隆接口（立即返回音频）"""
@@ -1129,7 +1096,7 @@ tags_metadata = [
 def _startup_preload_models():
     """启动时预加载所有模型"""
     print("\n" + "="*60)
-    print("正在启动 Qwen3-TTS 语音克隆服务...")
+    print("正在启动 Qwen3-TTS 语音克隆服务 (faster-qwen3-tts)...")
     print("="*60)
 
     try:
@@ -1378,9 +1345,10 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         model = _get_model(params["model"])
         _clone_task_log(task_id, f"模型已就绪，耗时 {time.time() - t_model:.2f}s")
         
-        # 处理文本（移除拼音标注 + 末尾全角空白防截断，不追加可读语气词）
-        text = _append_trailing_cjk_blanks(_apply_polyphonic(params["text"]))
-        ref_text = _apply_polyphonic(params["ref_text"])
+        # 处理文本
+        original_text = params["text"]
+        text = original_text.strip()
+        ref_text = params["ref_text"].strip()
         
         _clone_task_log(task_id, "准备参考音频（如需 ffmpeg 转 16kHz 可能耗时）")
         # 参考音频：优先使用提交时已保存的本地文件（避免排队后 base64 再解码丢格式）
@@ -1413,7 +1381,7 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
             )
             cleanup_ref_path = model_ref_path
 
-        # 生成语音（此处最耗时；若长时间无下一条日志，多为 GPU 推理挂起或极长文本）
+        # 生成语音
         _clone_task_log(
             task_id,
             f"开始 generate_voice_clone：len(text)={len(text)} lang={params.get('lang')} speed={params.get('speed')}",
@@ -1430,9 +1398,11 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         _clone_task_log(task_id, f"generate_voice_clone 结束，耗时 {time.time() - t_gen:.2f}s，sr={sr}")
 
         wav_raw = np.asarray(wavs[0], dtype=np.float32)
+
         _clone_task_log(task_id, f"开始语速/后处理 _apply_speed(speed={params.get('speed')})")
         t_sp = time.time()
-        wav_out = _apply_speed(wav_raw, params["speed"], sr)
+        sp = float(params["speed"])
+        wav_out = _apply_speed(wav_raw, sp, sr)
         _clone_task_log(task_id, f"_apply_speed 结束，耗时 {time.time() - t_sp:.2f}s")
         
         # 保存音频文件
@@ -1450,6 +1420,10 @@ def _process_voice_clone_task(user_id: str, task_id: str, params: Dict):
         _save_task(user_id, task_id, task_data)
         
         print(f"[OK] 任务 {task_id} 完成 (时长: {len(wav_out)/sr:.1f}s)", flush=True)
+
+        # 清理 CUDA 缓存，减少显存碎片化（对 2080Ti 等魔改卡尤其重要）
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # 字幕：默认后台线程，不阻塞队列上下一个 TTS（多任务连发时更顺滑）
         lang = params.get("lang", "")
@@ -1504,10 +1478,10 @@ def voice_clone_sync(req: VoiceCloneRequest):
         req_model_size = _effective_model_size(req.model_size)
         model = _get_model(req_model_size)
         
-        text = _append_trailing_cjk_blanks(_apply_polyphonic(req.text))
-        ref_text = _apply_polyphonic(req.ref_text)
-        
-        # 生成语音
+        original_text = req.text
+        text = original_text.strip()
+        ref_text = req.ref_text.strip()
+
         wavs, sr = _generate_voice_clone_with_fallback(
             model_size=req_model_size,
             text=text,
@@ -1516,13 +1490,11 @@ def voice_clone_sync(req: VoiceCloneRequest):
             ref_text=ref_text,
             x_vector_only_mode=req.x_vector_only_mode,
         )
-        
+
         wav_raw = np.asarray(wavs[0], dtype=np.float32)
-        wav_out = _apply_speed(
-            wav_raw,
-            req.speed if req.speed_enabled else 1.0,
-            sr,
-        )
+
+        sp = req.speed if req.speed_enabled else 1.0
+        wav_out = _apply_speed(wav_raw, sp, sr)
         
         # 编码为 base64 返回
         audio_b64 = _encode_wav_base64(wav_out, sr)
@@ -1977,6 +1949,12 @@ if __name__ == "__main__":
         choices=["0.6B", "1.7B"],
         help="默认模型大小（仅当显式传 --model-size 时才强制覆盖请求中的 model/model_size）。可选: 0.6B / 1.7B",
     )
+    parser.add_argument(
+        "--fp32",
+        action="store_true",
+        default=False,
+        help="强制使用 FP32 精度（适用于 2080Ti 等较老 GPU，防止 CUDA assert）",
+    )
     args = parser.parse_args()
     
     HOST = args.host
@@ -1986,6 +1964,8 @@ if __name__ == "__main__":
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu).strip()
     if args.workers and int(args.workers) > 0:
         os.environ["QWEN_TTS_QUEUE_WORKERS"] = str(int(args.workers))
+    if args.fp32:
+        os.environ["QWEN_TTS_FORCE_FP32"] = "1"
     # 只有显式传了 --model-size 才启用“强制覆盖请求模型”的模式；
     # 若未传，则接口可用请求里的 model/model_size 进行选择。
     if "--model-size" in sys.argv:
@@ -2003,6 +1983,8 @@ if __name__ == "__main__":
         print(f"[INFO] QWEN_TTS_QUEUE_WORKERS: {os.getenv('QWEN_TTS_QUEUE_WORKERS')}")
     if os.getenv("QWEN_TTS_DEFAULT_MODEL_SIZE", "").strip():
         print(f"[INFO] 默认模型: {os.getenv('QWEN_TTS_DEFAULT_MODEL_SIZE')}")
+    if os.getenv("QWEN_TTS_FORCE_FP32", "").strip().lower() in ("1", "true", "yes"):
+        print(f"[INFO] FP32 模式: 已启用（适用于 2080Ti 等较老 GPU）")
     print("="*60 + "\n")
     
     uvicorn.run(app, host=HOST, port=PORT)
