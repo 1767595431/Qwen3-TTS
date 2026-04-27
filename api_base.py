@@ -112,6 +112,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+# 将 faster-qwen3-tts 源码目录加入搜索路径（支持免安装部署）
+_FASTER_TTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "faster-qwen3-tts")
+if os.path.isdir(_FASTER_TTS_DIR) and _FASTER_TTS_DIR not in sys.path:
+    sys.path.insert(0, _FASTER_TTS_DIR)
+
 from faster_qwen3_tts import FasterQwen3TTS
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
